@@ -1,0 +1,17 @@
+services:
+  java4shell:
+    build:
+      context: .
+    image: java4shell-lab:local
+    # Intel SDE (Pin) injects into the target with ptrace.
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    # The lab is fully local and needs no network at runtime.
+    network_mode: none
+    ipc: private
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=512m
+    # Deliberate heap corruption: never reuse this container for anything else.
+    command: ["all"]

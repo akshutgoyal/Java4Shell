@@ -1,0 +1,7 @@
+sde-dl/
+sde/
+classes/
+*.class
+hs_err_pid*
+replay_pid*
+*.log
