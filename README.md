@@ -5,10 +5,10 @@ HotSpot x86-64 AVX-512 Base64 decoder heap overflow publicly called
 **Java4Shell** (also **Java2Shell**).
 
 > **Educational / authorized testing only.**
-> This lab deliberately corrupts its own JVM heap. Run it only in the provided
-> disposable container, and never against a system you do not own. It stops at
-> heap read/write and disclosure primitives; it does **not** include a
-> weaponized RCE chain.
+> This lab deliberately corrupts its own JVM heap and, in the optional `rce`
+> stage, executes attacker-supplied commands inside a disposable container.
+> Run it only in the provided container, and never against a system you do not
+> own. The RCE target is a purpose-built local service, not a real product.
 
 | | |
 |---|---|
@@ -18,7 +18,7 @@ HotSpot x86-64 AVX-512 Base64 decoder heap overflow publicly called
 | **Impact** | Heap out-of-bounds write; heap read/write and disclosure primitives; RCE in product-specific chains |
 | **Hardware gate** | x86-64 with `avx512f avx512bw avx512vbmi bmi2` (Ice Lake+ / Zen 4+) |
 | **Affected branches** | OpenJDK 17 (from 17.0.6), 21, 25, 27 |
-| **Lab scope** | Bounded trigger, length corruption, OOB read, heap leak, chosen-value OOB write |
+| **Lab scope** | Bounded trigger, length corruption, OOB read, heap leak, chosen-value OOB write, controlled RCE against a local target |
 
 ## In one sentence
 
@@ -28,7 +28,7 @@ the output buffer before Java throws an error.
 
 ## Status
 
-Tested end-to-end on **2026-11-21** with:
+Tested end-to-end on **2026-11-22** with:
 
 - **Eclipse Temurin 21.0.13+9** (pre-fix; fixed in 21.0.13.1)
 - **Intel SDE 10.13.1** (`sde64 -chip_check_disable -icx -- java ...`)
@@ -37,8 +37,9 @@ Tested end-to-end on **2026-11-21** with:
 - Docker with `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined
   --network none`
 
-All five stages behaved as expected: `trigger`, `corrupt`, `leak`, and `write`
-reproduced; `control` did not reproduce (which is the expected result).
+All base stages behaved as expected: `trigger`, `corrupt`, `leak`, and `write`
+reproduced; `control` did not reproduce (which is the expected result). The
+optional `rce` stage reached command execution, and `rce-control` did not.
 
 On a real AVX-512 host, use `LAB_MODE=native` to skip SDE.
 
@@ -54,8 +55,12 @@ shows how that fixed write becomes a useful primitive:
 3. Java's normal bounds checks then trust the corrupted length.
 4. Ordinary Java array reads and writes become out-of-bounds reads and writes.
 5. The same corruption gives a heap-disclosure primitive ("JavaBleed").
+6. In the optional RCE stage, a service reads its own configuration through the
+   corrupted array and executes the attacker's recovered command.
 
-The lab intentionally stops before the application-specific RCE chain.
+The RCE stage is deliberately scoped: the service's "maintenance hook" is part
+of the lab target, so the stage demonstrates the corruption-to-execution flow
+rather than a universal exploit for real products.
 
 ## Affected versions
 
@@ -103,7 +108,7 @@ git clone https://github.com/akshutgoyal/Java4Shell.git
 cd Java4Shell
 chmod +x run.sh
 
-./run.sh --build all     # build the image and run all five stages
+./run.sh --build all     # build the image and run the five base stages
 ```
 
 Run individual stages:
@@ -114,6 +119,8 @@ Run individual stages:
 ./run.sh corrupt     # heap corruption + OOB read
 ./run.sh leak        # JavaBleed-style heap disclosure
 ./run.sh write       # chosen-value OOB write into a neighbour
+./run.sh rce         # end-to-end RCE against a local vulnerable service
+./run.sh rce-control # same RCE attempt with the intrinsic disabled
 ```
 
 The first build downloads and SHA256-verifies Intel SDE from Intel's mirror.
@@ -145,6 +152,7 @@ docker compose run --rm java4shell trigger
 |---|---|---|
 | `LAB_MODE` | `auto`, `native`, `sde` | `auto` |
 | `LAB_WARMUP` | number of valid decodes | `1000` |
+| `LAB_RCE_CMD` | command the RCE client asks the target to run | `id; uname -a` |
 
 `auto` uses the native JVM when `/proc/cpuinfo` has all four AVX-512 flags, and
 SDE otherwise. Force it with `LAB_MODE=native` or `LAB_MODE=sde`.
@@ -220,6 +228,54 @@ OOB WRITE REPRODUCED
 Ordinary Java stores at `victim[80+i]` land in the neighbouring `target` array
 with attacker-chosen bytes.
 
+### `rce` — end-to-end command execution
+
+The RCE stage starts a deliberately vulnerable HTTP service (`poc/RceLab.java`)
+on loopback inside the container, then runs a separate attacker client
+(`poc/RceClient.java`) on a normal JVM:
+
+```text
+[*] target  http://127.0.0.1:18080
+[*] command id; uname -a
+[*] firing trigger ...
+    before=100
+    after=1771742825
+    hex=699aa669
+    unsigned=1771742825
+[*] blob length 100 -> 1771742825 (unsigned 1771742825)
+[*] scanning heap through blob[off] ...
+[*] payload at blob[120] = 4a34533a  (out of bounds)
+    RCE CONFIRMED
+    offset=120
+    cmd=id; uname -a
+    exit=0
+    uid=0(root) gid=0(root) groups=0(root)
+    Linux ... x86_64 GNU/Linux
+
+[+] RCE CHAIN COMPLETE: heap corruption -> OOB read -> command execution
+```
+
+The service models a maintenance hook: each `/trigger` request allocates a
+66-byte Base64 scratch buffer and, immediately after it in the same TLAB, a
+100-byte session blob that holds a config string. After the malformed decode,
+the blob's length is `0x699AA669`, so `/peek` (a "debug" reader) can return
+bytes past the original blob and `/exec` can load a config string from an
+attacker-chosen offset. The client finds its own command bytes in the heap and
+asks the service to execute them.
+
+`rce-control` runs the identical chain with `-XX:-UseBASE64Intrinsics`. The
+blob length stays `100`, `/peek` and `/exec` refuse out-of-range offsets, and
+the client reports `NO CORRUPTION (control path)`.
+
+**What this proves, and what it does not.** The chain uses only the write
+primitive supplied by the vulnerability, plus a read of adjacent heap through
+the corrupted length. It does not use a separate memory-safety bug. The lab
+target itself contains the "maintenance hook" that executes a string from the
+blob; a real product needs an equivalent gadget or data flow. The `J4S:` prefix
+is a lab guard against executing random heap bytes, not a security boundary.
+No JVM code-cache or metadata corruption is performed, and the forged length is
+never repaired, so the process is disposable by design.
+
 **Notes**
 
 - `./run.sh control` exits 1 by design. `./run.sh all` prints each stage's exit
@@ -292,6 +348,8 @@ out-of-bounds accesses are plain Java bytecode.
 | `poc/HeapCorruption.java` | A 66-byte destination places the next array's length field at store offset 36. The length becomes `0x699AA669`, and a normal Java read at index 4096 succeeds. |
 | `poc/HeapLeak.java` | A neighbouring `secret` array is disclosed through ordinary Java reads on the now-huge victim. |
 | `poc/HeapWrite.java` | The same corrupted length turns ordinary Java stores into a chosen-value OOB write into a neighbouring array. |
+| `poc/RceLab.java` | Deliberately vulnerable HTTP target: decode sink, corrupted session blob, and a maintenance hook that executes a recovered config string. |
+| `poc/RceClient.java` | Attacker client: fires the trigger, scans the heap through the corrupted length, and asks the target to execute the recovered command. |
 
 `HeapCorruption`, `HeapLeak`, and `HeapWrite` deliberately poison their own
 heap and call `Runtime.getRuntime().halt()` before GC can traverse the corrupted
@@ -299,16 +357,24 @@ object. Run them only in the disposable container.
 
 ## Scope and limitations
 
-- **No RCE chain.** The lab stops at read/write and disclosure. Calif's public
-  write-up describes the next stages: corrupt a "writer" array's length, use it
-  to corrupt a "reader" array's length, leak heap memory, repair damaged
-  headers, groom G1/TLAB allocation, and eventually reach the JVM Code Cache.
-  The product-specific chains were withheld by the researchers.
+- **RCE is demonstrated against a purpose-built target.** The `rce` stage shows
+  the full chain: heap overflow → corrupted length → out-of-bounds heap read →
+  command execution. It stops there. It does not implement the JVM Code Cache
+  corruption or the product-specific heap-grooming chains that Calif withheld.
 - **No universal payload.** A real chain needs a reachable decoder, a suitable
   heap layout, a live writer/reader pair or other feedback path, and
-  application-specific timing. Network conditions matter.
+  application-specific timing. Network conditions matter. The lab target is
+  shaped so one request can reach the sink; real products differ.
+- **The sink is part of the lab, not the vulnerability.** `RceLab` contains a
+  maintenance hook that runs a string it reads from the session blob. A real
+  target needs an equivalent primitive (a command/config read, a deserialization
+  path, a template or scripting engine, and so on). The exploit moves the
+  attacker's bytes into that sink; it does not create the sink.
 - **Heap grooming is simplified here.** The pinned image gives deterministic
   TLAB adjacency. Real targets need G1/TLAB grooming, spraying, and retries.
+- **The corruption is not repaired.** The smashing stages halt the JVM before GC
+  sees the forged header. The RCE service is intentionally disposable and runs
+  with a single-thread executor on loopback.
 - **SDE is CPU emulation, not bug emulation.** It spoofs an Ice Lake CPUID so
   HotSpot generates the real AVX-512 stub; SDE executes the actual JVM machine
   code.
@@ -381,6 +447,8 @@ poc/Base64Trigger.java  bounded, non-destructive trigger
 poc/HeapCorruption.java length corruption + OOB read
 poc/HeapLeak.java       JavaBleed-style heap disclosure
 poc/HeapWrite.java      chosen-value OOB write
+poc/RceLab.java         vulnerable HTTP target for the RCE stage
+poc/RceClient.java      attacker client for the RCE stage
 compose.yaml            optional Compose configuration
 ```
 

