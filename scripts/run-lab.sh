@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # Java4Shell (CVE-2026-114938) lab runner.
 #
-# Usage: run-lab [trigger|control|corrupt|leak|write|rce|rce-control|all]
+# Usage: run-lab [trigger|control|corrupt|leak|write|chain|chain-control|rce|rce-control|all]
 #
-#   trigger      bounded, non-destructive OOB-write measurement
-#   control      same trigger with -XX:-UseBASE64Intrinsics (must not reproduce)
-#   corrupt      overwrite a neighbouring array's length + OOB read
-#   leak         JavaBleed-style heap disclosure (marker in a neighbour array)
-#   write        use the corrupted length for a chosen-value OOB write
-#   rce          controlled RCE: corruption -> OOB read -> command execution
-#   rce-control  same as rce, but with -XX:-UseBASE64Intrinsics (must not reproduce)
-#   all          run the five base stages (default)
+#   trigger       bounded, non-destructive OOB-write measurement
+#   control       same trigger with -XX:-UseBASE64Intrinsics (must not reproduce)
+#   corrupt       overwrite a neighbouring array's length + OOB read
+#   leak          JavaBleed-style heap disclosure (marker in a neighbour array)
+#   write         use the corrupted length for a chosen-value OOB write
+#   chain         writer -> reader -> forged header -> repair + GC survival
+#   chain-control same chain with -XX:-UseBASE64Intrinsics (must not reproduce)
+#   rce           controlled RCE against a local service (application sink)
+#   rce-control   same as rce, but with -XX:-UseBASE64Intrinsics (must not reproduce)
+#   all           run the five base stages + chain (default)
 #
 # Environment:
 #   LAB_MODE=native|sde|auto   (default auto)
@@ -112,6 +114,25 @@ do_write() {
     run HeapWrite --warmup "$WARMUP"
 }
 
+do_chain() {
+    EXTRA_OPTS=()
+    banner "second half: writer -> reader -> forged header -> repair + GC"
+    run Chain --warmup "$WARMUP"
+}
+
+do_chain_control() {
+    EXTRA_OPTS=(-XX:-UseBASE64Intrinsics)
+    banner "control: second half with -XX:-UseBASE64Intrinsics"
+    run Chain --warmup "$WARMUP"
+    local rc=$?
+    if [ "$rc" = 1 ]; then
+        # Exit 1 from Chain means "length unchanged" - the expected control result.
+        echo "[chain-control] OK: no corruption without the vulnerable intrinsic"
+        return 0
+    fi
+    return "$rc"
+}
+
 rce_run() {
     # $1 = mode label, $2 = extra JVM flags (space-free array passed via name)
     local label="$1"
@@ -175,6 +196,8 @@ case "$TEST" in
     corrupt) do_corrupt ;;
     leak)    do_leak ;;
     write)   do_write ;;
+    chain)   do_chain ;;
+    chain-control) do_chain_control ;;
     rce)     do_rce ;;
     rce-control) do_rce_control ;;
     all)
@@ -183,16 +206,18 @@ case "$TEST" in
         do_corrupt; echo "[corrupt] exit=$?"
         do_leak;    echo "[leak]    exit=$?"
         do_write;   echo "[write]   exit=$?"
+        do_chain;   echo "[chain]   exit=$?"
         echo
         echo "Done. Expected: trigger=REPRODUCED, control=NOT REPRODUCED,"
         echo "corrupt=OOB READ REPRODUCED, leak=JAVA BLEED REPRODUCED,"
-        echo "write=OOB WRITE REPRODUCED."
+        echo "write=OOB WRITE REPRODUCED, chain=CHAIN COMPLETE."
         echo
-        echo "Optional: ./run.sh rce            (controlled RCE, ~3 min)"
-        echo "          ./run.sh rce-control    (negative control)"
+        echo "Optional: ./run.sh chain-control    (negative control for chain)"
+        echo "          ./run.sh rce              (application sink, ~3 min)"
+        echo "          ./run.sh rce-control      (negative control for rce)"
         ;;
     *)
-        echo "usage: $0 [trigger|control|corrupt|leak|write|rce|rce-control|all]" >&2
+        echo "usage: $0 [trigger|control|corrupt|leak|write|chain|chain-control|rce|rce-control|all]" >&2
         exit 2
         ;;
 esac

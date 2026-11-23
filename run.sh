@@ -7,6 +7,8 @@
 #   ./run.sh corrupt         # heap corruption + OOB read
 #   ./run.sh leak            # JavaBleed disclosure
 #   ./run.sh write           # chosen-value OOB write
+#   ./run.sh chain           # writer -> reader -> forged header -> repair + GC
+#   ./run.sh chain-control   # same chain, intrinsic disabled (must fail)
 #   ./run.sh rce             # controlled RCE (separate stage)
 #   ./run.sh rce-control     # negative control for rce
 #   ./run.sh --build all     # force a rebuild first
