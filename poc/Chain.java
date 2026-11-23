@@ -286,27 +286,24 @@ public final class Chain {
 
     private static void phaseCodeCache() {
         System.out.println();
-        System.out.println("=== PHASE 5: Code Cache attempt ===");
+        System.out.println("=== PHASE 5: beyond the heap ===");
         System.out.println("Heap primitives held:");
         System.out.println("  - chosen-value linear write   (writer)");
         System.out.println("  - heap disclosure             (reader)");
         System.out.println("  - forged-header object access (fake oop)");
         System.out.println();
-        System.out.println("To reach the Code Cache we would need to dereference a native");
-        System.out.println("pointer, for example a Method* stored in a MemberName.method long,");
-        System.out.println("or an nmethod entry.  This chain has no such dereference:");
-        System.out.println("  * every reference is a 32-bit compressed oop (heap-relative),");
-        System.out.println("  * array addressing is base + non-negative int index,");
-        System.out.println("  * so the forged view can only move forward inside the Java heap.");
-        System.out.println("A Method* read through this primitive is data, not code, and");
-        System.out.println("nothing here can load it as an instruction pointer.");
+        System.out.println("This chain is heap-only: every reference is a 32-bit compressed");
+        System.out.println("oop and every array access is base + non-negative int, so it");
+        System.out.println("cannot leave the Java heap.");
         System.out.println();
-        System.out.println("Honest result: the chain reaches arbitrary heap object read/write");
-        System.out.println("and survives GC, but stops one primitive short of Code Cache RCE.");
-        System.out.println("Reaching it needs a raw native read/write (e.g. Unsafe, JNI, or a");
-        System.out.println("second memory-safety bug), which this lab deliberately does not add.");
+        System.out.println("That is a limit of THIS chain, not of the vulnerability.");
+        System.out.println("poc/NativeProbe.java shows the next step: corrupting a");
+        System.out.println("DirectByteBuffer.address field turns the writer into a 64-bit");
+        System.out.println("native read/write, with no Unsafe, JNI, or second bug.  The");
+        System.out.println("JVM's Code Cache is an RWX mapping in that same address space.");
         System.out.println();
-        System.out.println("CHAIN COMPLETE (heap writer/reader/forge/repair); CODE CACHE BLOCKED");
+        System.out.println("CHAIN COMPLETE (heap writer/reader/forge/repair)");
+        System.out.println("NATIVE ACCESS IS REACHABLE: see the 'native' stage");
     }
 
     // ---------------- helpers ----------------
