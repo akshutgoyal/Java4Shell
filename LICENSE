@@ -19,11 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-This repository contains security research code that deliberately corrupts a
-JVM and executes shellcode. It is provided for education, vulnerability
-research and detection engineering only. Use it exclusively on systems you own
-or have explicit written permission to test. The authors accept no liability
-for misuse or for any damage caused by running this software.

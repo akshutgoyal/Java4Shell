@@ -373,7 +373,10 @@ downloaded at build time and is not redistributed here.
 - Lab containerisation, heap-exploitation chain, native primitive and Code Cache
   stage: **Akshut Goyal**.
 
-Licensed under the **MIT License** — see [LICENSE](LICENSE). The licence covers
-this repository's original code. The bounded trigger follows Calif's published
-PoC; credit for that work belongs to Calif. Intel SDE is not redistributed and
-remains under Intel's own licence.
+Licensed under the **MIT License** — see [LICENSE](LICENSE). Read
+[NOTICE.md](NOTICE.md) before running anything: this code is for authorized
+testing only.
+
+The licence covers this repository's original code. The bounded trigger follows
+Calif's published PoC; credit for that work belongs to Calif. Intel SDE is not
+redistributed and remains under Intel's own licence.
